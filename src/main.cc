@@ -639,6 +639,10 @@ main(int argc, char **argv)
 		start_loop = start_loop && ev_activecnt(loop()) > events;
 		region_free(&fiber()->gc);
 		if (start_loop) {
+			sd_notifyf(0, "READY=1\n"
+				      "STATUS=entering the event loop\n"
+				      "MAINPID=%lu",
+				      (unsigned long) getpid());
 			say_crit("entering the event loop");
 			ev_now_update(loop());
 			ev_run(loop(), 0);
