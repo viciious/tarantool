@@ -748,7 +748,7 @@ tuple_to_buf(const struct tuple *tuple, char *buf, size_t size);
 
 /** Initialize tuple library */
 void
-tuple_init(float alloc_arena_max_size, uint32_t slab_alloc_minimal,
+tuple_init(uint64_t alloc_arena_max_size, uint32_t slab_alloc_minimal,
 	   uint32_t slab_alloc_maximal, float alloc_factor);
 
 /** Cleanup tuple library */

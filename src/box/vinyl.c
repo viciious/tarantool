@@ -4939,7 +4939,7 @@ vy_conf_new()
 	}
 	conf->memory_limit = cfg_getd("vinyl.memory_limit")*1024*1024*1024;
 
-	conf->path = strdup(cfg_gets("vinyl_dir"));
+	conf->path = strdup(cfg_gets("vinyl.vinyl_dir"));
 	if (conf->path == NULL) {
 		diag_set(OutOfMemory, sizeof(*conf), "conf", "path");
 		goto error_1;

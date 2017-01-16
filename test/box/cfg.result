@@ -28,6 +28,15 @@ cfg_filter(box.cfg)
     - <hidden>
   - - logger_nonblock
     - true
+  - - memtx
+    - - - slab_alloc_arena
+        - 107374182
+      - - slab_alloc_factor
+        - 1.1
+      - - slab_alloc_maximal
+        - <hidden>
+      - - slab_alloc_minimal
+        - <hidden>
   - - panic_on_snap_error
     - true
   - - panic_on_wal_error
@@ -67,6 +76,8 @@ cfg_filter(box.cfg)
         - 1073741824
       - - threads
         - 1
+      - - vinyl_dir
+        - <hidden>
   - - vinyl_dir
     - <hidden>
   - - wal_dir
@@ -98,6 +109,15 @@ cfg_filter(box.cfg)
     - <hidden>
   - - logger_nonblock
     - true
+  - - memtx
+    - - - slab_alloc_arena
+        - 107374182
+      - - slab_alloc_factor
+        - 1.1
+      - - slab_alloc_maximal
+        - <hidden>
+      - - slab_alloc_minimal
+        - <hidden>
   - - panic_on_snap_error
     - true
   - - panic_on_wal_error
@@ -137,6 +157,8 @@ cfg_filter(box.cfg)
         - 1073741824
       - - threads
         - 1
+      - - vinyl_dir
+        - <hidden>
   - - vinyl_dir
     - <hidden>
   - - wal_dir

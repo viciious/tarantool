@@ -353,7 +353,7 @@ box_check_config()
 	box_check_readahead(cfg_geti("readahead"));
 	box_check_rows_per_wal(cfg_geti64("rows_per_wal"));
 	box_check_wal_mode(cfg_gets("wal_mode"));
-	box_check_slab_alloc_minimal(cfg_geti64("slab_alloc_minimal"));
+	box_check_slab_alloc_minimal(cfg_geti64("memtx.slab_alloc_minimal"));
 }
 
 /*
@@ -1405,10 +1405,10 @@ bootstrap(struct vclock *start_vclock)
 static inline void
 box_init(void)
 {
-	tuple_init(cfg_getd("slab_alloc_arena"),
-		   cfg_geti("slab_alloc_minimal"),
-		   cfg_geti("slab_alloc_maximal"),
-		   cfg_getd("slab_alloc_factor"));
+	tuple_init(cfg_geti("memtx.slab_alloc_arena"),
+		   cfg_geti("memtx.slab_alloc_minimal"),
+		   cfg_geti("memtx.slab_alloc_maximal"),
+		   cfg_getd("memtx.slab_alloc_factor"));
 
 	rmean_box = rmean_new(iproto_type_strs, IPROTO_TYPE_STAT_MAX);
 	rmean_error = rmean_new(rmean_error_strings, RMEAN_ERROR_LAST);

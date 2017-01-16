@@ -1,5 +1,6 @@
 -- load_cfg.lua - internal file
 
+local math = require('math')
 local log = require('log')
 local json = require('json')
 local private = require('box.internal')
@@ -11,19 +12,20 @@ local default_vinyl_cfg = {
     compact_wm        = 2, -- try to maintain less than 2 runs in a range
     range_size        = 1024 * 1024 * 1024,
     page_size        = 8 * 1024,
+    vinyl_dir          = '.',
 }
 
 -- all available options
 local default_cfg = {
     listen              = nil,
-    slab_alloc_arena    = 1.0,
-    slab_alloc_minimal  = 16,
-    slab_alloc_maximal  = 1024 * 1024,
-    slab_alloc_factor   = 1.1,
+    memtx = {
+        slab_alloc_arena    = 1024 * 1024 * 1024,
+        slab_alloc_minimal  = 16,
+        slab_alloc_maximal  = 1024 * 1024,
+        slab_alloc_factor   = 1.1,},
     work_dir            = nil,
     snap_dir            = ".",
     wal_dir             = ".",
-    vinyl_dir          = '.',
     vinyl              = default_vinyl_cfg,
     logger              = nil,
     logger_nonblock     = true,
@@ -44,24 +46,32 @@ local default_cfg = {
     username            = nil,
     coredump            = false,
     read_only           = false,
-    hot_standby	        = false,
+    hot_standby                = false,
 
     -- snapshot_daemon
     snapshot_period     = 0,        -- 0 = disabled
     snapshot_count      = 6,
 }
 
+local memtx_template_cfg = {
+    slab_alloc_arena    = 'number, string',
+    slab_alloc_minimal  = 'number, string',
+    slab_alloc_maximal  = 'number, string',
+    slab_alloc_factor   = 'number',
+}
+
 -- see template_cfg below
 local vinyl_template_cfg = {
-    memory_limit      = 'number',
+    vinyl_dir          = 'string',
+    memory_limit      = 'number, string',
     threads           = 'number',
     compact_wm        = 'number',
     run_prio          = 'number',
     run_age           = 'number',
     run_age_period    = 'number',
     run_age_wm        = 'number',
-    range_size        = 'number',
-    page_size        = 'number',
+    range_size        = 'number, string',
+    page_size         = 'number, string',
 }
 
 -- types of available options
@@ -98,7 +108,22 @@ local template_cfg = {
     snapshot_period     = 'number',
     snapshot_count      = 'number',
     read_only           = 'boolean',
-    hot_standby         = 'boolean'
+    hot_standby         = 'boolean',
+    memtx               = memtx_template_cfg,
+}
+
+local cfg_option_translate = {
+    slab_alloc_arena    = {'memtx',
+        function (size)
+            return math.floor(size * 1024 * 1024 * 1024)
+        end,
+        function (size)
+            return math.floor(1000 * size / (1024 * 1024 * 1024) + 0.5) / 1000
+        end},
+    slab_alloc_minimal  = 'memtx',
+    slab_alloc_maximal  = 'memtx',
+    slab_alloc_factor   = 'memtx',
+    vinyl_dir           = 'vinyl',
 }
 
 local function normalize_uri(port)
@@ -108,11 +133,42 @@ local function normalize_uri(port)
     return tostring(port);
 end
 
+local function normalize_size(size)
+    if type(size) == 'number' then
+        return size
+    end
+    local m
+    local e
+    m, e = string.match(size, '([1-9][0-9]*)([kmg]?)')
+    if size ~= m .. (e or '') then
+        error('mallformed size: ' .. size)
+    end
+    m = tonumber(m)
+    if e == nil or e == '' then
+        return m
+    end
+    if e == 'k' then
+        return m * 1024
+    elseif e == 'm' then
+        return m * 1024 * 1024
+    end
+    return m * 1024 * 1024 * 1024
+end
+
 -- options that require special handling
 local modify_cfg = {
     listen             = normalize_uri,
     replication_source = normalize_uri,
-}
+    memtx              = {
+        slab_alloc_arena    = normalize_size,
+        slab_alloc_minimal  = normalize_size,
+        slab_alloc_maximal  = normalize_size,
+    },
+    vinyl              = {
+        range_size          = normalize_size,
+	page_size           = normalize_size,
+	memory_limit        = normalize_size,
+    },}
 
 -- dynamically settable options
 local dynamic_cfg = {
@@ -132,7 +188,9 @@ local dynamic_cfg = {
     wal_dir_rescan_delay    = function() end,
     custom_proc_title       = function()
         require('title').update(box.cfg.custom_proc_title)
-    end
+    end,
+    memtx = {},
+    vinyl = {},
 }
 
 local dynamic_cfg_skip_at_load = {
@@ -142,9 +200,34 @@ local dynamic_cfg_skip_at_load = {
     wal_dir_rescan_delay    = true,
     panic_on_wal_error      = true,
     custom_proc_title       = true,
+    memtx                   = true,
+    vinyl                   = true,
 }
 
-local function prepare_cfg(cfg, default_cfg, template_cfg, modify_cfg, prefix)
+local function translate_cfg(cfg, translate_cfg)
+    for k, v in pairs(cfg) do
+        local target
+        local value
+        if type(translate_cfg[k]) == 'string' then
+            target = translate_cfg[k]
+            value = v
+               elseif type(translate_cfg[k]) == 'table' then
+            target = translate_cfg[k][1]
+            value = translate_cfg[k][2](v)
+        end
+               if target ~= nil then
+            if cfg[target] == nil then
+                cfg[target] = {}
+            end
+            if cfg[target][k] ~= nil and cfg[target][k] ~= value then
+                error('Conflicting option for ' .. target .. '.' .. k)
+            end
+            cfg[target][k] = value
+        end
+    end
+end
+
+local function prepare_cfg(cfg, default_cfg, template_cfg, modify_cfg, prefix, path)
     if cfg == nil then
         return {}
     end
@@ -206,10 +289,13 @@ local function apply_default_cfg(cfg, default_cfg)
     end
 end
 
-local function reload_cfg(oldcfg, cfg)
-    local newcfg = prepare_cfg(cfg, default_cfg, template_cfg, modify_cfg)
+local function update_cfg(oldcfg, cfg, newcfg, dynamic_cfg, path)
+    path = path or ''
     -- iterate over original table because prepare_cfg() may store NILs
     for key, val in pairs(cfg) do
+        if type(dynamic_cfg[key]) == 'table' then
+            return update_cfg(oldcfg[key], cfg[key], newcfg[key], dynamic_cfg[key], path .. '.' .. key)
+        end
         if dynamic_cfg[key] == nil and oldcfg[key] ~= val then
             box.error(box.error.RELOAD_CFG, key);
         end
@@ -227,6 +313,12 @@ local function reload_cfg(oldcfg, cfg)
                 json.encode(val))
         end
     end
+end
+
+local function reload_cfg(oldcfg, cfg)
+    translate_cfg(cfg, cfg_option_translate)
+    local newcfg = prepare_cfg(cfg, default_cfg, template_cfg, modify_cfg)
+    update_cfg(oldcfg, cfg, newcfg, dynamic_cfg)
     if type(box.on_reload_configuration) == 'function' then
         box.on_reload_configuration()
     end
@@ -251,6 +343,7 @@ setmetatable(box, {
 })
 
 local function load_cfg(cfg)
+    translate_cfg(cfg, cfg_option_translate)
     cfg = prepare_cfg(cfg, default_cfg, template_cfg, modify_cfg)
     apply_default_cfg(cfg, default_cfg);
     -- Save new box.cfg
@@ -262,6 +355,13 @@ local function load_cfg(cfg)
     -- Restore box members after initial configuration
     for k, v in pairs(box_configured) do
         box[k] = v
+    end
+    for key, target in pairs(cfg_option_translate) do
+        if type(target) == 'table' then
+            cfg[key] = target[3](cfg[target[1]][key])
+        else
+            cfg[key] = cfg[target][key]
+        end
     end
     setmetatable(box, nil)
     box_configured = nil
