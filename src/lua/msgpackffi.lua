@@ -205,6 +205,7 @@ local function encode_nil(buf)
 end
 
 local function encode_r(buf, obj, level)
+::restart::
     if type(obj) == "number" then
         -- Lua-way to check that number is an integer
         if obj % 1 == 0 and obj > -1e63 and obj < 1e64 then
@@ -219,21 +220,43 @@ local function encode_r(buf, obj, level)
             encode_nil(buf)
             return
         end
-        if #obj > 0 then
-            encode_array(buf, #obj)
-            local i
-            for i=1,#obj,1 do
+        local serialize = nil
+        local mt = getmetatable(obj)
+        if mt ~= nil then
+            serialize = mt.__serialize
+        end
+        if type(serialize) == 'function' then
+            obj = serialize(obj)
+            goto restart
+        end
+        local array_size = nil
+        if serialize == nil then
+            array_size = #obj
+            if array_size == 0 and next(obj) ~= nil then
+                array_size = nil
+            end
+        elseif serialize == 'array' or serialize == 'seq' or
+               serialize == 'sequence' then
+                -- calculate array size
+                array_size = 0
+                for key in pairs(obj) do -- goodbye, JIT
+                    if type(key) == 'number' and math.floor(key) == key then
+                        array_size = math.max(key, array_size)
+                    end
+                end
+        elseif serialize ~= 'map' and serialize ~= 'mapping' then
+            error("Invalid __serialize value")
+        end
+        if array_size ~= nil then
+            encode_array(buf, array_size)
+            for i=1,array_size,1 do
                 encode_r(buf, obj[i], level + 1)
             end
         else
+            -- calculate map size
             local size = 0
-            local key, val
-            for key, val in pairs(obj) do -- goodbye, JIT
+            for key in pairs(obj) do -- goodbye, JIT
                 size = size + 1
-            end
-            if size == 0 then
-                encode_array(buf, 0) -- encode empty table as an array
-                return
             end
             encode_map(buf, size)
             for key, val in pairs(obj) do
