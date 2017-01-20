@@ -141,6 +141,7 @@
  * int bps_tree_delete(tree, elem);
  * size_t bps_tree_size(tree);
  * size_t bps_tree_mem_used(tree);
+ * size_t bps_tree_worst_growth(tree, element_to_add);
  * bps_tree_elem_t *bps_tree_random(tree, rnd);
  * int bps_tree_debug_check(tree);
  * void bps_tree_print(tree, "%p");
@@ -349,6 +350,7 @@ typedef uint32_t bps_tree_block_id_t;
 #define bps_tree_delete _api_name(delete)
 #define bps_tree_size _api_name(size)
 #define bps_tree_mem_used _api_name(mem_used)
+#define bps_tree_worst_growth _api_name(worst_growth)
 #define bps_tree_random _api_name(random)
 #define bps_tree_invalid_iterator _api_name(invalid_iterator)
 #define bps_tree_iterator_is_invalid _api_name(iterator_is_invalid)
@@ -619,7 +621,7 @@ bps_tree_delete(struct bps_tree *tree, bps_tree_elem_t elem);
 /**
  * @brief Get size of tree, i.e. count of elements in tree
  * @param tree - pointer to a tree
- * @return - count count of elements in tree
+ * @return - count of elements in tree
  */
 static inline size_t
 bps_tree_size(const struct bps_tree *tree);
@@ -628,16 +630,25 @@ bps_tree_size(const struct bps_tree *tree);
  * @brief Get amount of memory in bytes that the tree is using
  *  (not including sizeof(struct bps_tree))
  * @param tree - pointer to a tree
- * @return - count count of elements in tree
+ * @return - dynamic memory consumption on bytes
  */
 static inline size_t
 bps_tree_mem_used(const struct bps_tree *tree);
 
 /**
+ * @brief Get amount of memory in bytes that would be needed if
+ *  elements_to_add WORST CASE elements were added the tree
+ * @param tree - pointer to a tree
+ * @return - worst case memory requirements
+ */
+static inline size_t
+bps_tree_worst_growth(const struct bps_tree *tree, size_t elements_to_add);
+
+/**
  * @brief Get a random element in a tree.
  * @param tree - pointer to a tree
  * @param rnd - some random value
- * @return - count count of elements in tree
+ * @return - a random elements
  */
 static inline bps_tree_elem_t *
 bps_tree_random(const struct bps_tree *tree, size_t rnd);
@@ -1188,7 +1199,7 @@ bps_tree_destroy(struct bps_tree *tree)
 /**
  * @brief Get size of tree, i.e. count of elements in tree
  * @param tree - pointer to a tree
- * @return - count count of elements in tree
+ * @return - count of elements in tree
  */
 static inline size_t
 bps_tree_size(const struct bps_tree *tree)
@@ -1200,7 +1211,7 @@ bps_tree_size(const struct bps_tree *tree)
  * @brief Get amount of memory in bytes that the tree is using
  *  (not including sizeof(struct bps_tree))
  * @param tree - pointer to a tree
- * @return - count count of elements in tree
+ * @return - dynamic memory consumption on bytes
  */
 static inline size_t
 bps_tree_mem_used(const struct bps_tree *tree)
@@ -1208,6 +1219,54 @@ bps_tree_mem_used(const struct bps_tree *tree)
 	size_t res = matras_extent_count(&tree->matras);
 	res *= BPS_TREE_EXTENT_SIZE;
 	return res;
+}
+
+/**
+ * @brief Get amount of memory in bytes that would be needed if
+ *  elements_to_add WORST CASE elements were added the tree
+ * @param tree - pointer to a tree
+ * @return - worst case memory requirements
+ */
+static inline size_t
+bps_tree_worst_growth(const struct bps_tree *tree, size_t elements_to_add)
+{
+	size_t total_count = tree->size + elements_to_add;
+	/* At first, calculate the worst-case block count in tree */
+	size_t block_count = 0;
+	size_t item_count = total_count;
+	size_t min_capaciny = BPS_TREE_MAX_COUNT_IN_LEAF * 2 / 3;
+	size_t tree_height = 0;
+	while (item_count > 0) {
+		tree_height++;
+		if (item_count == 1) {
+			block_count++;
+			break;
+		} else {
+			size_t add_blocks =
+				1 + (item_count - 1) / min_capaciny;
+			block_count += add_blocks;
+			item_count = add_blocks;
+		}
+		min_capaciny = BPS_TREE_MAX_COUNT_IN_INNER * 2 / 3;
+	}
+	/* Another bound if worst case */
+	size_t another_block_count = tree->leaf_count + tree->inner_count +
+		tree->garbage_count + elements_to_add * tree_height;
+	if (block_count > another_block_count)
+		block_count = another_block_count;
+	/* Then calculate extent count needed for that case */
+	size_t extent_count = 0;
+	item_count = block_count;
+	min_capaciny = BPS_TREE_EXTENT_SIZE / BPS_TREE_BLOCK_SIZE;
+	for (int i = 0; i < 3; i++) {
+		size_t add_extents =
+			1 + (item_count - 1) / min_capaciny;
+		extent_count += add_extents;
+		item_count = add_extents;
+		min_capaciny = BPS_TREE_EXTENT_SIZE / sizeof(void *);
+	}
+	/* And substract current size */
+	return extent_count * BPS_TREE_EXTENT_SIZE - bps_tree_mem_used(tree);
 }
 
 /**
@@ -1251,7 +1310,7 @@ bps_tree_touch_block(struct bps_tree *tree, bps_tree_block_id_t id)
  * @brief Get a random element in a tree.
  * @param tree - pointer to a tree
  * @param rnd - some random value
- * @return - count count of elements in tree
+ * @return - a random element
  */
 static inline bps_tree_elem_t *
 bps_tree_random(const struct bps_tree *tree, size_t rnd)
@@ -5713,6 +5772,7 @@ bps_tree_debug_check_internal_functions(bool assertme)
 #undef bps_tree_delete
 #undef bps_tree_size
 #undef bps_tree_mem_used
+#undef bps_tree_worst_growth
 #undef bps_tree_random
 #undef bps_tree_invalid_iterator
 #undef bps_tree_iterator_is_invalid

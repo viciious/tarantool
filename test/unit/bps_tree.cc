@@ -27,9 +27,9 @@ compare(type_t a, type_t b);
 #define BPS_TREE_EXTENT_SIZE 16*1024 /* value is to low specially for tests */
 #define BPS_TREE_COMPARE(a, b, arg) compare(a, b)
 #define BPS_TREE_COMPARE_KEY(a, b, arg) compare(a, b)
-#define bps_tree_elem_t char
-#define bps_tree_key_t char
-#define bps_tree_arg_t int
+#define bps_tree_elem_t type_t
+#define bps_tree_key_t type_t
+#define bps_tree_arg_t void *
 #include "salad/bps_tree.h"
 #undef BPS_TREE_NAME
 #undef BPS_TREE_BLOCK_SIZE
@@ -756,6 +756,38 @@ approximate_count()
 	footer();
 }
 
+static void
+worst_growth()
+{
+	header();
+	srand(1);
+
+	test tree;
+	test_create(&tree, 0, extent_alloc, extent_free, &extents_count);
+
+	const size_t num_tests = 1024;
+	const size_t max_inserts = 128;
+	unsigned error_count = 0;
+
+	for (size_t i = 0; i < num_tests; i++) {
+		size_t inserts = rand() % max_inserts;
+		size_t expected = test_worst_growth(&tree, inserts);
+		size_t was = test_mem_used(&tree);
+		for (size_t j = 0; j < inserts; j++) {
+			type_t v = rand();
+			test_insert(&tree, v, 0);
+		}
+		size_t growth = test_mem_used(&tree) - was;
+		if (growth > expected)
+			error_count++;
+	}
+	printf("error count: %u\n", error_count);
+
+	test_destroy(&tree);
+
+	footer();
+}
+
 int
 main(void)
 {
@@ -767,6 +799,7 @@ main(void)
 	printing_test();
 	white_box_test();
 	approximate_count();
+	worst_growth();
 	if (extents_count != 0)
 		fail("memory leak!", "true");
 }
