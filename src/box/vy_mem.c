@@ -34,7 +34,9 @@
 
 #include <trivia/util.h>
 #include <small/lsregion.h>
+#include <small/region.h>
 #include "diag.h"
+#include "fiber.h"
 
 /** {{{ vy_mem */
 
@@ -109,30 +111,93 @@ vy_mem_older_lsn(struct vy_mem *mem, const struct tuple *stmt)
 	return result;
 }
 
-int
-vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt,
-	      int64_t alloc_lsn)
+/*
+ * Same as vy_stmt_extract_key(), but allocates the new statement
+ * on the lsregion.
+ */
+static struct tuple *
+vy_stmt_extract_lsregion_key(const struct tuple *stmt,
+			     const struct key_def *key_def,
+			     struct region *region, struct lsregion *lsregion,
+			     int64_t alloc_lsn)
 {
-	size_t size = tuple_size(stmt);
-	struct tuple *mem_stmt;
-	mem_stmt = lsregion_alloc(mem->allocator, size, alloc_lsn);
-	if (mem_stmt == NULL) {
-		diag_set(OutOfMemory, size, "lsregion_alloc", "mem_stmt");
-		return -1;
+	struct tuple_format *format = tuple_format_by_id(stmt->format_id);
+	assert(!vy_stmt_key_compatible(stmt));
+	bool part_of_update = vy_stmt_part_of_update(stmt);
+	size_t region_svp = region_used(region);
+	uint32_t size;
+	const char *key = tuple_extract_key(stmt, key_def, &size);
+	if (key == NULL)
+		goto error;
+	uint32_t total = size + sizeof(struct vy_stmt);
+	if (part_of_update)
+		/*
+		 * Size of the column mask.
+		 * @sa vy_index.column_mask.
+		 */
+		total += sizeof(uint64_t);
+	struct tuple *ret = lsregion_alloc(lsregion, total, alloc_lsn);
+	if (ret == NULL) {
+		diag_set(OutOfMemory, size, "lsregion_alloc", "ret");
+		goto error;
 	}
-	memcpy(mem_stmt, stmt, size);
-	/*
-	 * Region allocated statements can't be referenced or unreferenced
-	 * because they are located in monolithic memory region. Referencing has
-	 * sense only for separately allocated memory blocks.
-	 * The reference count here is set to 0 for an assertion if somebody
-	 * will try to unreference this statement.
-	 */
-	mem_stmt->refs = 0;
+	memset(ret, 0, sizeof(struct vy_stmt));
+	ret->format_id = tuple_format_id(format);
+	ret->bsize = size;
+	vy_stmt_set_part_of_update(ret, part_of_update);
+	vy_stmt_set_lsn(ret, vy_stmt_lsn(stmt));
+	vy_stmt_set_type(ret, vy_stmt_type(stmt));
+	vy_stmt_set_key_compatible(ret, true);
+	ret->data_offset = sizeof(struct vy_stmt);
+	if (part_of_update) {
+		ret->data_offset += sizeof(uint64_t);
+		vy_stmt_set_column_mask(ret, vy_stmt_column_mask(stmt));
+	}
+	memcpy((char *) ret + ret->data_offset, key, size);
+	region_truncate(region, region_svp);
+	return ret;
+error:
+	region_truncate(region, region_svp);
+	return NULL;
+}
+
+int
+vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt, int64_t alloc_lsn)
+{
+	struct key_def *def = mem->key_def;
+	struct tuple *mem_stmt = NULL;
+	size_t size;
+	if (def->iid == 0) {
+		size = tuple_size(stmt);
+		mem_stmt = lsregion_alloc(mem->allocator, size, alloc_lsn);
+		if (mem_stmt == NULL) {
+			diag_set(OutOfMemory, size, "lsregion_alloc", "mem_stmt");
+			return -1;
+		}
+		memcpy(mem_stmt, stmt, size);
+		/*
+		 * Region allocated statements can't be referenced
+		 * or unreferenced because they are located in
+		 * monolithic memory region. Referencing has sense
+		 * only for separately allocated memory blocks.
+		 * The reference count here is set to 0 for an
+		 * assertion if somebody will try to unreference
+		 * this statement.
+		 */
+		mem_stmt->refs = 0;
+	} else {
+		assert(!vy_stmt_key_compatible(stmt));
+		mem_stmt = vy_stmt_extract_lsregion_key(stmt, def, &fiber()->gc,
+							mem->allocator,
+							alloc_lsn);
+		if (mem_stmt != NULL)
+			size = tuple_size(mem_stmt);
+	}
+	if (mem_stmt == NULL)
+		return -1;
 
 	const struct tuple *replaced_stmt = NULL;
-	int rc = vy_mem_tree_insert(&mem->tree, mem_stmt, &replaced_stmt);
-	if (rc != 0)
+	if (vy_mem_tree_insert(&mem->tree, mem_stmt, &replaced_stmt) != 0)
 		return -1;
 
 	if (mem->used == 0)
@@ -144,7 +209,6 @@ vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt,
 
 	return 0;
 }
-
 /* }}} vy_mem */
 
 /* {{{ vy_mem_iterator support functions */

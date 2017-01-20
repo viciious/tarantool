@@ -106,9 +106,9 @@ vy_stmt_alloc(struct tuple_format *format, uint32_t size)
 	tuple_format_ref(format, 1);
 	tuple->bsize = 0;
 	tuple->data_offset = 0;
-	vy_stmt_lsn_set(tuple, 0);
-	vy_stmt_type_set(tuple, 0);
-	vy_stmt_n_upserts_set(tuple, 0);
+	vy_stmt_set_lsn(tuple, 0);
+	vy_stmt_set_type(tuple, 0);
+	((struct vy_stmt *) tuple)->flags = 0;
 	return tuple;
 }
 
@@ -168,7 +168,8 @@ vy_stmt_new_key(struct tuple_format *format, const char *key,
 	char *data = mp_encode_array(raw, part_count);
 	memcpy(data, key, key_size);
 	assert(data + key_size == raw + size);
-	vy_stmt_type_set(stmt, type);
+	vy_stmt_set_type(stmt, type);
+	vy_stmt_set_key_compatible(stmt, true);
 	return stmt;
 }
 
@@ -187,6 +188,104 @@ vy_stmt_new_delete(struct tuple_format *format, const char *key,
 }
 
 /**
+ * @sa vy_stmt_extract_full_delete.
+ * @param format         Format of a space.
+ * @param key            MessagePack array of key fields.
+ * @param key_end        End of the key.
+ * @param part_of_update True if the DELETE is part of an UPDATE
+ *                       operation.
+ * @param def            Key definition for building the offsets
+ *                       table the all key fields.
+ *                       @sa vy_index.key_def_tuple_to_delete
+ * @retval not NULL Success.
+ * @retval     NULL Memory error.
+ */
+struct tuple *
+vy_stmt_new_full_delete(struct tuple_format *format, const char *key,
+			const char *key_end, bool part_of_update,
+			const struct key_def *def)
+{
+	assert(key_end > key);
+	uint32_t bsize = key_end - key;
+	uint32_t total = bsize + format->field_map_size;
+	if (part_of_update)
+		total += sizeof(uint64_t);
+	struct tuple *delete = vy_stmt_alloc(format, total);
+	if (delete == NULL)
+		return NULL;
+	delete->bsize = bsize;
+	delete->data_offset = sizeof(struct vy_stmt) + format->field_map_size;
+	if (part_of_update)
+		delete->data_offset += sizeof(uint64_t);
+	vy_stmt_set_type(delete, IPROTO_DELETE);
+	vy_stmt_set_key_compatible(delete, false);
+	vy_stmt_set_part_of_update(delete, part_of_update);
+	char *raw = (char *) delete + delete->data_offset;
+	memcpy(raw, key, bsize);
+	uint32_t *field_map = (uint32_t *) raw;
+
+	if (format->field_count == 0)
+		return delete; /* Nothing to initialize */
+
+	const char *pos = raw;
+	mp_decode_array(&pos);
+
+
+	/* First field is simply accessible, so we do not store offset to it. */
+	enum mp_type mp_type = mp_typeof(*pos);
+	if (def->parts[0].fieldno == 0)
+		mp_next(&pos);
+
+	/*
+	 * Initialize offsets to all fields, because \a key is the
+	 * array of only indexes fields already extracted from a
+	 * tuple.
+	 */
+	for (uint32_t i = 1; i < format->field_count; i++) {
+		struct tuple_field_format *field = &format->fields[i];
+		if (field->offset_slot >= 0)
+			continue;
+		mp_type = mp_typeof(*pos);
+		field_map[field->offset_slot] = (uint32_t) (pos - raw);
+		mp_next(&pos);
+	}
+	return delete;
+}
+
+struct tuple *
+vy_stmt_extract_full_delete(struct tuple_format *format,
+			    const struct key_def *def,
+			    const struct tuple *stmt)
+{
+	assert(! vy_stmt_key_compatible(stmt));
+	uint32_t key_size;
+	const char *key = tuple_extract_key(stmt, def, &key_size);
+	if (key == NULL)
+		return NULL;
+	return vy_stmt_new_full_delete(format, key, key + key_size,
+				       false, def);
+}
+
+struct tuple *
+vy_stmt_extract_delete_with_mask(struct tuple_format *format,
+				 const struct key_def *def,
+				 const struct tuple *stmt,
+				 uint64_t column_mask)
+{
+	assert(! vy_stmt_key_compatible(stmt));
+	uint32_t key_size;
+	const char *key = tuple_extract_key(stmt, def, &key_size);
+	if (key == NULL)
+		return NULL;
+	struct tuple *t = vy_stmt_new_full_delete(format, key, key + key_size,
+						  true, def);
+	if (t != NULL)
+		vy_stmt_set_column_mask(t, column_mask);
+	return t;
+}
+
+
+/**
  * Create a statement without type and with reserved space for operations.
  * Operations can be saved in the space available by @param extra.
  * For details @sa struct vy_stmt comment.
@@ -194,8 +293,8 @@ vy_stmt_new_delete(struct tuple_format *format, const char *key,
 struct tuple *
 vy_stmt_new_with_ops(const char *tuple_begin, const char *tuple_end,
 		     uint8_t type, struct tuple_format *format,
-		     uint32_t part_count,
-		     struct iovec *operations, uint32_t iovcnt)
+		     uint32_t part_count, struct iovec *operations,
+		     uint32_t iovcnt, size_t extra_size)
 {
 	(void) part_count; /* unused in release. */
 #ifndef NDEBUG
@@ -207,10 +306,9 @@ vy_stmt_new_with_ops(const char *tuple_begin, const char *tuple_end,
 	uint32_t field_count = mp_decode_array(&tuple_begin);
 	assert(field_count >= part_count);
 
-	uint32_t extra_size = 0;
-	for (uint32_t i = 0; i < iovcnt; ++i) {
-		extra_size += operations[i].iov_len;
-	}
+	uint32_t ops_size = 0;
+	for (uint32_t i = 0; i < iovcnt; ++i)
+		ops_size += operations[i].iov_len;
 
 	/*
 	 * Allocate stmt. Offsets: one per key part + offset of the
@@ -219,13 +317,14 @@ vy_stmt_new_with_ops(const char *tuple_begin, const char *tuple_end,
 	uint32_t offsets_size = format->field_map_size;
 	uint32_t bsize = tuple_end - tuple_begin;
 	uint32_t size = offsets_size + mp_sizeof_array(field_count) +
-			bsize + extra_size;
+			bsize + ops_size + extra_size;
 	struct tuple *stmt = vy_stmt_alloc(format, size);
 	if (stmt == NULL)
 		return NULL;
+	((struct vy_stmt *) stmt)->flags = 0;
 	stmt->bsize = bsize +  mp_sizeof_array(field_count);
 	/* Copy MsgPack data */
-	stmt->data_offset = offsets_size + sizeof(struct vy_stmt);
+	stmt->data_offset = offsets_size + sizeof(struct vy_stmt) + extra_size;
 	char *raw = (char *) stmt + stmt->data_offset;
 	char *wpos = mp_encode_array(raw, field_count);
 	memcpy(wpos, tuple_begin, bsize);
@@ -237,8 +336,8 @@ vy_stmt_new_with_ops(const char *tuple_begin, const char *tuple_end,
 		memcpy(wpos, op->iov_base, op->iov_len);
 		wpos += op->iov_len;
 	}
-	stmt->bsize += extra_size;
-	vy_stmt_type_set(stmt, type);
+	stmt->bsize += ops_size;
+	vy_stmt_set_type(stmt, type);
 
 	/* Calculate offsets for key parts */
 	if (tuple_init_field_map(format, (uint32_t *) raw, raw)) {
@@ -254,7 +353,7 @@ vy_stmt_new_upsert(const char *tuple_begin, const char *tuple_end,
 		   struct iovec *operations, uint32_t ops_cnt)
 {
 	return vy_stmt_new_with_ops(tuple_begin, tuple_end, IPROTO_UPSERT,
-				    format, part_count, operations, ops_cnt);
+				    format, part_count, operations, ops_cnt, 1);
 }
 
 struct tuple *
@@ -262,7 +361,23 @@ vy_stmt_new_replace(const char *tuple_begin, const char *tuple_end,
 		    struct tuple_format *format, uint32_t part_count)
 {
 	return vy_stmt_new_with_ops(tuple_begin, tuple_end, IPROTO_REPLACE,
-				    format, part_count, NULL, 0);
+				    format, part_count, NULL, 0, 0);
+}
+
+struct tuple *
+vy_stmt_new_replace_with_mask(const char *tuple_begin, const char *tuple_end,
+			      struct tuple_format *format, uint32_t part_count,
+			      uint64_t column_mask)
+{
+	struct tuple *stmt =
+		vy_stmt_new_with_ops(tuple_begin, tuple_end, IPROTO_REPLACE,
+				     format, part_count, NULL, 0,
+				     sizeof(uint64_t));
+	if (stmt != NULL) {
+		vy_stmt_set_part_of_update(stmt, true);
+		vy_stmt_set_column_mask(stmt, column_mask);
+	}
+	return stmt;
 }
 
 struct tuple *
@@ -283,47 +398,79 @@ vy_stmt_replace_from_upsert(const struct tuple *upsert)
 	memcpy((char *) replace + sizeof(struct vy_stmt),
 	       (char *) upsert + sizeof(struct vy_stmt), size);
 	replace->bsize = bsize;
-	vy_stmt_type_set(replace, IPROTO_REPLACE);
-	vy_stmt_lsn_set(replace, vy_stmt_lsn(upsert));
+	vy_stmt_set_type(replace, IPROTO_REPLACE);
+	vy_stmt_set_lsn(replace, vy_stmt_lsn(upsert));
+	/*
+	 * The original statement has UPSERT type so the statement
+	 * contains full tuple with not only indexed fields and
+	 * the result REPLACE contains not indexed too. So this
+	 * REPLACE is not compatible with key.
+	 */
+	vy_stmt_set_key_compatible(replace, false);
 	replace->data_offset = upsert->data_offset;
 	return replace;
 }
 
 struct tuple *
 vy_stmt_extract_key(const struct tuple *stmt, const struct key_def *key_def,
-		    struct region *region)
+		    struct region *region, uint8_t type)
 {
-	uint8_t type = vy_stmt_type(stmt);
 	struct tuple_format *format = tuple_format_by_id(stmt->format_id);
-	if (type == IPROTO_SELECT || type == IPROTO_DELETE) {
+	if (vy_stmt_key_compatible(stmt)) {
 		/*
-		 * The statement already is a key, so simply copy it in new
-		 * struct vy_stmt as SELECT.
+		 * The statement already is a key, so simply copy
+		 * it in new struct vy_stmt as SELECT.
 		 */
-		struct tuple *res = vy_stmt_dup(stmt);
-		if (res != NULL)
-			vy_stmt_type_set(res, IPROTO_SELECT);
-		return res;
+		return vy_key_from_msgpack(format, vy_stmt_cast_to_key(stmt),
+					   type);
 	}
-	assert(type == IPROTO_REPLACE || type == IPROTO_UPSERT);
+	bool part_of_update = vy_stmt_part_of_update(stmt);
 	uint32_t size;
 	size_t region_svp = region_used(region);
-	char *key = tuple_extract_key(stmt, key_def, &size);
+	const char *key = tuple_extract_key(stmt, key_def, &size);
 	if (key == NULL)
 		goto error;
-	struct tuple *ret = vy_stmt_alloc(format, size);
-	if (ret == NULL)
-		goto error;
-	memcpy((char *) ret + sizeof(struct vy_stmt), key, size);
+	struct tuple *ret;
+	/*
+	 * If the statement is not part of an UPDATE operation
+	 * then no need to reserve space for the column mask.
+	 */
+	if (! part_of_update) {
+		ret = vy_stmt_alloc(format, size);
+		if (ret == NULL)
+			goto error;
+		ret->data_offset = sizeof(struct vy_stmt);
+	} else {
+		ret = vy_stmt_alloc(format, size + sizeof(uint64_t));
+		if (ret == NULL)
+			goto error;
+		ret->data_offset = sizeof(struct vy_stmt) + sizeof(uint64_t);
+		vy_stmt_set_part_of_update(ret, part_of_update);
+		vy_stmt_set_column_mask(ret, vy_stmt_column_mask(stmt));
+	}
+	memcpy((char *) ret + ret->data_offset, key, size);
 	region_truncate(region, region_svp);
-	vy_stmt_type_set(ret, IPROTO_SELECT);
-	ret->data_offset = sizeof(struct vy_stmt);
+	vy_stmt_set_type(ret, type);
+	vy_stmt_set_key_compatible(ret, true);
 	ret->bsize = size;
 	return ret;
 error:
 	region_truncate(region, region_svp);
 	return NULL;
 }
+
+struct tuple *
+vy_key_from_msgpack(struct tuple_format *format, const char *key, uint8_t type)
+{
+	uint32_t part_count;
+	/*
+	 * The statement already is a key, so simply copy it in
+	 * the new struct vy_stmt with the specified type.
+	 */
+	part_count = mp_decode_array(&key);
+	return vy_stmt_new_key(format, key, part_count, type);
+}
+
 
 int
 vy_stmt_encode(const struct tuple *value, const struct key_def *key_def,
@@ -379,9 +526,13 @@ vy_stmt_decode(struct xrow_header *xrow, struct tuple_format *format,
 		stmt = vy_stmt_new_delete(format, request.key, field_count);
 		break;
 	case IPROTO_REPLACE:
-		stmt = vy_stmt_new_replace(request.tuple,
-					   request.tuple_end,
-					   format, part_count);
+		if (request.index_id == 0)
+			stmt = vy_stmt_new_replace(request.tuple,
+						   request.tuple_end, format,
+						   part_count);
+		else
+			stmt = vy_key_from_msgpack(format, request.tuple,
+						   IPROTO_REPLACE);
 		break;
 	case IPROTO_UPSERT:
 		ops.iov_base = (char *)request.ops;
@@ -398,7 +549,7 @@ vy_stmt_decode(struct xrow_header *xrow, struct tuple_format *format,
 	if (stmt == NULL)
 		return NULL; /* OOM */
 
-	vy_stmt_lsn_set(stmt, xrow->lsn);
+	vy_stmt_set_lsn(stmt, xrow->lsn);
 	return stmt;
 }
 

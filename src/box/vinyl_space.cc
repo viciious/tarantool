@@ -193,5 +193,6 @@ VinylSpace::commitAlterSpace(struct space *old_space, struct space *new_space)
 		/* This is drop space. */
 		return;
 	}
-	vy_commit_alter_space(old_space, new_space);
+	if (vy_commit_alter_space(old_space, new_space) != 0)
+		diag_raise();
 }
