@@ -41,6 +41,9 @@
 #include <stdlib.h>
 #include <ctype.h>
 
+#include <box/session.h>
+#include <box/lua/session.h>
+
 /*
  * Completion engine (Mike Paul's).
  * Used internally when collecting completions locally. Also a Lua
@@ -114,7 +117,7 @@ console_completion_handler(const char *text, int start, int end)
 		lua_pop(readline_L, 1);
 		return NULL;
 	}
-	res = malloc(sizeof(res[0]) * (n + 1));
+	res = (char **)malloc(sizeof(res[0]) * (n + 1));
 	if (res == NULL) {
 		lua_pop(readline_L, 1);
 		return NULL;
@@ -204,7 +207,7 @@ lbox_console_readline(struct lua_State *L)
 		rl_inhibit_completion = 0;
 		rl_attempted_completion_function = console_completion_handler;
 		rl_completer_word_break_characters =
-			"\t\r\n !\"#$%&'()*+,-/;<=>?@[\\]^`{|}~";
+			(char *)"\t\r\n !\"#$%&'()*+,-/;<=>?@[\\]^`{|}~";
 		rl_completer_quote_characters = "\"'";
 #if RL_READLINE_VERSION < 0x0600
 		rl_completion_append_character = '\0';
@@ -321,6 +324,86 @@ lbox_console_add_history(struct lua_State *L)
 	return 0;
 }
 
+uint32_t CTID_CONST_STRUCT_SESSION_REF;
+
+static inline struct session *
+lua_checksession(struct lua_State *L, int narg)
+{
+	assert(CTID_CONST_STRUCT_SESSION_REF != 0);
+	uint32_t ctypeid;
+	void *data;
+
+	if (lua_type(L, narg) != LUA_TCDATA)
+		return NULL;
+
+	data = luaL_checkcdata(L, narg, &ctypeid);
+	if (ctypeid != CTID_CONST_STRUCT_SESSION_REF)
+		return NULL;
+
+	if (data == NULL)  {
+		luaL_error(L, "Invalid argument #%d (session expected, got %s)",
+		           narg, lua_typename(L, lua_type(L, narg)));
+	}
+
+	return (struct session *)data;
+}
+
+static int
+lbox_session_gc(struct lua_State *L)
+{
+	struct session *s = lua_checksession(L, 1);
+	session_destroy(s);
+	return 0;
+}
+
+void
+lua_pushsession(struct lua_State *L, struct session *s)
+{
+	assert(CTID_CONST_STRUCT_SESSION_REF != 0);
+	struct session **ptr = (struct session**)
+		luaL_pushcdata(L, CTID_CONST_STRUCT_SESSION_REF);
+	*ptr = s;
+	lua_pushcfunction(L, lbox_session_gc);
+	luaL_setcdatagc(L, -2);
+}
+
+static int
+lbox_console_exec_on_connect(struct lua_State *L)
+{
+	struct session *s = lua_checksession(L, -1);
+	if (!rlist_empty(&session_on_connect))
+		session_run_on_connect_triggers(s);
+	return 0;
+}
+
+static int
+lbox_console_exec_on_disconnect(struct lua_State *L)
+{
+	struct session *s = lua_checksession(L, -1);
+	if (!rlist_empty(&session_on_disconnect))
+		session_run_on_disconnect_triggers(s);
+	return 0;
+}
+
+static int
+lbox_console_session_setfd(struct lua_State *L)
+{
+	struct session *s = lua_checksession(L, 1);
+	int fd = luaL_checkinteger(L, 2);
+
+	s->fd = fd;
+	return 0;
+}
+
+static int
+lbox_console_session_create(struct lua_State *L)
+{
+	struct session *s = session_create(-1);
+	say_info("box_session_sid: %d", (int )s->id);
+	lua_pushsession(L, s);
+	return 1;
+}
+
 void
 tarantool_lua_console_init(struct lua_State *L)
 {
@@ -329,6 +412,10 @@ tarantool_lua_console_init(struct lua_State *L)
 		{"save_history",       lbox_console_save_history},
 		{"add_history",        lbox_console_add_history},
 		{"completion_handler", lbox_console_completion_handler},
+		{"exec_on_connect",    lbox_console_exec_on_connect},
+		{"exec_on_disconnect", lbox_console_exec_on_disconnect},
+		{"session_create",     lbox_console_session_create},
+		{"session_setfd",      lbox_console_session_setfd},
 		{NULL, NULL}
 	};
 	luaL_register_module(L, "console", consolelib);
@@ -337,10 +424,16 @@ tarantool_lua_console_init(struct lua_State *L)
 	lua_getfield(L, -1, "completion_handler");
 	lua_pushcclosure(L, lbox_console_readline, 1);
 	lua_setfield(L, -2, "readline");
+
+	/* Get CTypeID for `struct session' */
+	int rc = luaL_cdef(L, "struct session;");
+	assert(rc == 0); (void) rc;
+	CTID_CONST_STRUCT_SESSION_REF = luaL_ctypeid(L, "const struct session &");
+	assert(CTID_CONST_STRUCT_SESSION_REF != 0);
 }
 
 /*
- * Completion engine from "Mike Paul's advanced readline patch".
+ * Completion engine from "Mike Pall's advanced readline patch".
  * With minor fixes and code style tweaks.
  */
 #define lua_pushglobaltable(L) lua_pushvalue(L, LUA_GLOBALSINDEX)
@@ -415,7 +508,7 @@ lua_rl_dmadd(dmlist *ml, const char *p, size_t pn, const char *s, int suf)
 
 	if (ml->idx+1 >= ml->allocated) {
 		char **new_list;
-		new_list = realloc(
+		new_list = (char **)realloc(
 			ml->list, sizeof(char *)*(ml->allocated += 32));
 		if (!new_list)
 			return -1;
@@ -604,7 +697,7 @@ error:
 		/* list[0] holds the common prefix of all matches (may
 		 * be ""). If there is only one match, list[0] and
 		 * list[1] will be the same. */
-		ml.list[0] = malloc(sizeof(char)*(ml.matchlen+1));
+		ml.list[0] = (char *)malloc(sizeof(char)*(ml.matchlen+1));
 		if (!ml.list[0])
 			goto error;
 		memcpy(ml.list[0], ml.list[1], ml.matchlen);

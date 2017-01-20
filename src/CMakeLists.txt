@@ -109,7 +109,7 @@ set (server_sources
      proc_title.c
      coeio_file.c
      clock.c
-     lua/console.c
+     lua/console.cc
      lua/digest.c
      lua/init.c
      lua/fiber.c

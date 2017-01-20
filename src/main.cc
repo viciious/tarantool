@@ -74,6 +74,9 @@
 #include <libutil.h>
 #include "box/lua/init.h" /* box_lua_init() */
 
+#include "box/user.h"
+#include "box/session.h"
+
 static pid_t master_pid = getpid();
 static struct pidfh *pid_file_handle;
 static char *script = NULL;
@@ -613,6 +616,15 @@ main(int argc, char **argv)
 	coeio_enable();
 	signal_init();
 	tarantool_lua_init(tarantool_bin, main_argc, main_argv);
+
+	user_cache_init();
+	/*
+	 * The order is important: to initialize sessions,
+	 * we need to access the admin user, which is used
+	 * as a default session user when running triggers.
+	 */
+	session_init();
+
 	box_lua_init(tarantool_L);
 
 	/* main core cleanup routine */

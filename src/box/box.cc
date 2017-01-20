@@ -1422,13 +1422,6 @@ box_init(void)
 	engine_init();
 
 	schema_init();
-	user_cache_init();
-	/*
-	 * The order is important: to initialize sessions,
-	 * we need to access the admin user, which is used
-	 * as a default session user when running triggers.
-	 */
-	session_init();
 
 	cluster_init();
 	port_init();

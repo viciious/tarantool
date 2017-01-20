@@ -338,20 +338,22 @@ local function connect(uri)
     return true
 end
 
-local function client_handler(client, peer)
-    log.info("client %s:%s connected", peer.host, peer.port)
-    local state = setmetatable({
-        running = true;
-        read = client_read;
-        print = client_print;
-        client = client;
-    }, repl_mt)
-    local version = _TARANTOOL
-    state:print(string.format("%-63s\n%-63s\n",
-        "Tarantool ".. version.." (Lua console)",
-        "type 'help' for interactive help"))
-    repl(state)
-    log.info("client %s:%s disconnected", peer.host, peer.port)
+local function client_handler_closure(session)
+    return function(client, peer)
+        internal.exec_on_connect(session)
+        local state = setmetatable({
+            running = true;
+            read = client_read;
+            print = client_print;
+            client = client;
+        }, repl_mt)
+        local version = _TARANTOOL
+        state:print(string.format("%-63s\n%-63s\n",
+            "Tarantool ".. version.." (Lua console)",
+            "type 'help' for interactive help"))
+        repl(state)
+        internal.exec_on_disconnect(session)
+    end
 end
 
 --
@@ -370,8 +372,13 @@ local function listen(uri)
         host = u.host
         port = u.service or 3313
     end
-    local s, addr = socket.tcp_server(host, port, { handler = client_handler,
-        name = 'console'})
+    local session = internal.session_create()
+    local s, addr = socket.tcp_server(host, port, {
+        handler = client_handler_closure(session),
+        name = 'console'
+    })
+    internal.session_setfd(session, s:fd())
+    s.session = session
     if not s then
         error(string.format('failed to create server %s:%s: %s',
             host, port, errno.strerror()))
