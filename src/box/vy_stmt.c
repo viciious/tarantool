@@ -67,6 +67,7 @@ vy_tuple_new(struct tuple_format *format, const char *data, const char *end)
 		return NULL;
 	}
 	new_tuple->refs = 0;
+	say_debug("%s(%zu) = %p", __func__, tuple_len, new_tuple);
 	return new_tuple;
 }
 
@@ -75,6 +76,8 @@ vy_tuple_delete(struct tuple_format *format, struct tuple *tuple)
 {
 	say_debug("%s(%p)", __func__, tuple);
 	assert(tuple->refs == 0);
+	if (vy_stmt_from_region(tuple))
+		return;
 	tuple_format_ref(format, -1);
 #ifndef NDEBUG
 	memset(tuple, '#', tuple_size(tuple)); /* fail early */
@@ -109,6 +112,7 @@ vy_stmt_alloc(struct tuple_format *format, uint32_t size)
 	vy_stmt_set_lsn(tuple, 0);
 	vy_stmt_set_type(tuple, 0);
 	((struct vy_stmt *) tuple)->flags = 0;
+	say_debug("%s(%lu) = %p", __func__, (long unsigned) size, tuple);
 	return tuple;
 }
 

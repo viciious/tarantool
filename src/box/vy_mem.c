@@ -148,6 +148,7 @@ vy_stmt_extract_lsregion_key(const struct tuple *stmt,
 	vy_stmt_set_lsn(ret, vy_stmt_lsn(stmt));
 	vy_stmt_set_type(ret, vy_stmt_type(stmt));
 	vy_stmt_set_key_compatible(ret, true);
+	vy_stmt_set_region(ret, true);
 	ret->data_offset = sizeof(struct vy_stmt);
 	if (part_of_update) {
 		ret->data_offset += sizeof(uint64_t);
@@ -175,6 +176,7 @@ vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt, int64_t alloc_lsn)
 			return -1;
 		}
 		memcpy(mem_stmt, stmt, size);
+		vy_stmt_set_region(mem_stmt, true);
 		/*
 		 * Region allocated statements can't be referenced
 		 * or unreferenced because they are located in
@@ -196,7 +198,7 @@ vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt, int64_t alloc_lsn)
 	if (mem_stmt == NULL)
 		return -1;
 
-	const struct tuple *replaced_stmt = NULL;
+	struct tuple *replaced_stmt = NULL;
 	if (vy_mem_tree_insert(&mem->tree, mem_stmt, &replaced_stmt) != 0)
 		return -1;
 
@@ -214,27 +216,9 @@ vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt, int64_t alloc_lsn)
 /* {{{ vy_mem_iterator support functions */
 
 /**
- * Copy current statement into the out parameter. It is necessary
- * because vy_mem stores its tuples in the lsregion allocated
- * area, and lsregion tuples can't be referenced or unreferenced.
- */
-static int
-vy_mem_iterator_copy_to(struct vy_mem_iterator *itr, struct tuple **ret)
-{
-	assert(itr->curr_stmt != NULL);
-	if (itr->last_stmt)
-		tuple_unref(itr->last_stmt);
-	itr->last_stmt = vy_stmt_dup(itr->curr_stmt);
-	*ret = itr->last_stmt;
-	if (itr->last_stmt != NULL)
-		return 0;
-	return -1;
-}
-
-/**
  * Get a stmt by current position
  */
-static const struct tuple *
+static struct tuple *
 vy_mem_iterator_curr_stmt(struct vy_mem_iterator *itr)
 {
 	return *vy_mem_tree_iterator_get_elem(&itr->mem->tree, &itr->curr_pos);
@@ -285,7 +269,7 @@ vy_mem_iterator_find_lsn(struct vy_mem_iterator *itr)
 		vy_mem_tree_iterator_prev(&itr->mem->tree, &prev_pos);
 
 		while (!vy_mem_tree_iterator_is_invalid(&prev_pos)) {
-			const struct tuple *prev_stmt =
+			struct tuple *prev_stmt =
 				*vy_mem_tree_iterator_get_elem(&itr->mem->tree,
 							       &prev_pos);
 			if (vy_stmt_lsn(prev_stmt) > *itr->vlsn ||
@@ -363,7 +347,7 @@ vy_mem_iterator_check_version(struct vy_mem_iterator *itr)
 	if (itr->version == itr->mem->version)
 		return;
 	itr->version = itr->mem->version;
-	const struct tuple * const *record;
+	struct tuple **record;
 	record = vy_mem_tree_iterator_get_elem(&itr->mem->tree, &itr->curr_pos);
 	if (record != NULL && *record == itr->curr_stmt)
 		return;
@@ -455,7 +439,7 @@ vy_mem_iterator_next_key(struct vy_stmt_iterator *vitr, struct tuple **ret)
 	*ret = NULL;
 
 	if (vy_mem_iterator_next_key_impl(itr) == 0)
-		return vy_mem_iterator_copy_to(itr, ret);
+		*ret = itr->curr_stmt;
 	return 0;
 }
 
@@ -481,7 +465,7 @@ vy_mem_iterator_next_lsn_impl(struct vy_mem_iterator *itr)
 	if (vy_mem_tree_iterator_is_invalid(&next_pos))
 		return 1; /* EOF */
 
-	const struct tuple *next_stmt;
+	struct tuple *next_stmt;
 	next_stmt = *vy_mem_tree_iterator_get_elem(&itr->mem->tree, &next_pos);
 	if (vy_stmt_compare(itr->curr_stmt, next_stmt, key_def) == 0) {
 		itr->curr_pos = next_pos;
@@ -502,7 +486,7 @@ vy_mem_iterator_next_lsn(struct vy_stmt_iterator *vitr, struct tuple **ret)
 	struct vy_mem_iterator *itr = (struct vy_mem_iterator *) vitr;
 	*ret = NULL;
 	if (vy_mem_iterator_next_lsn_impl(itr) == 0)
-		return vy_mem_iterator_copy_to(itr, ret);
+		*ret = itr->curr_stmt;
 	return 0;
 }
 
@@ -527,7 +511,7 @@ vy_mem_iterator_restore(struct vy_stmt_iterator *vitr,
 	if (!itr->search_started) {
 		if (last_stmt == NULL) {
 			if (vy_mem_iterator_start(itr) == 0)
-				return vy_mem_iterator_copy_to(itr, ret);
+				*ret = itr->curr_stmt;
 			return 0;
 		}
 
@@ -574,15 +558,12 @@ vy_mem_iterator_restore(struct vy_stmt_iterator *vitr,
 					   def) != 0) {
 			return true;
 		}
-		if (itr->curr_stmt != NULL &&
-		    vy_mem_iterator_copy_to(itr, ret) < 0)
-			return -1;
+		*ret = itr->curr_stmt;
 		return position_changed;
 	}
 
 	if (itr->version == itr->mem->version) {
-		if (itr->curr_stmt)
-			return vy_mem_iterator_copy_to(itr, ret);
+		*ret = itr->curr_stmt;
 		return 0;
 	}
 
@@ -604,7 +585,7 @@ vy_mem_iterator_restore(struct vy_stmt_iterator *vitr,
 			vy_mem_tree_iterator_prev(&itr->mem->tree, &pos);
 			if (vy_mem_tree_iterator_is_invalid(&pos))
 				break;
-			const struct tuple *t;
+			struct tuple *t;
 			t = *vy_mem_tree_iterator_get_elem(&itr->mem->tree,
 							   &pos);
 			int cmp;
@@ -618,8 +599,7 @@ vy_mem_iterator_restore(struct vy_stmt_iterator *vitr,
 				rc = 1;
 			}
 		}
-		if (vy_mem_iterator_copy_to(itr, ret) < 0)
-			return -1;
+		*ret = itr->curr_stmt;
 		return rc;
 	}
 	assert(itr->iterator_type == ITER_LE || itr->iterator_type == ITER_LT);
@@ -630,7 +610,7 @@ vy_mem_iterator_restore(struct vy_stmt_iterator *vitr,
 		vy_mem_tree_iterator_prev(&itr->mem->tree, &pos);
 		if (vy_mem_tree_iterator_is_invalid(&pos))
 			break;
-		const struct tuple *t;
+		struct tuple *t;
 		t = *vy_mem_tree_iterator_get_elem(&itr->mem->tree, &pos);
 		int cmp;
 		cmp = vy_stmt_compare(t, itr->curr_stmt, def);
@@ -641,8 +621,7 @@ vy_mem_iterator_restore(struct vy_stmt_iterator *vitr,
 		itr->curr_stmt = t;
 		rc = 1;
 	}
-	if (vy_mem_iterator_copy_to(itr, ret) < 0)
-		return -1;
+	*ret = itr->curr_stmt;
 	return rc;
 }
 

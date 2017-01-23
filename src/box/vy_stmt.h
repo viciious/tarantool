@@ -95,7 +95,13 @@ enum vy_stmt_flags {
 	 * created during the UPDATE of a space with secondary
 	 * indexes.
 	 */
-	VY_PART_OF_UPDATE = 0x02
+	VY_PART_OF_UPDATE = 0x02,
+	/**
+	 * True if the statement was allocated on a region memory.
+	 * That is it can't be freed by calling free() function.
+	 * To free the statement need to free the region.
+	 */
+	VY_REGION_MEMORY = 0x04
 };
 struct vy_stmt {
 	struct tuple base;
@@ -169,6 +175,29 @@ vy_stmt_set_key_compatible(struct tuple *stmt, bool f)
 	else
 		((struct vy_stmt *) stmt)->flags &=
 			~((uint8_t) VY_KEY_COMPATIBLE);
+}
+
+/**
+ * Set that the statement was or wasn't allocated on region
+ * memory.
+ */
+static inline void
+vy_stmt_set_region(struct tuple *stmt, bool f)
+{
+	if (f)
+		((struct vy_stmt *) stmt)->flags |= VY_REGION_MEMORY;
+	else
+		((struct vy_stmt *) stmt)->flags &=
+			~((uint8_t) VY_REGION_MEMORY);
+}
+
+/**
+ * Return true, if the statement was allocated on region memory.
+ */
+static inline bool
+vy_stmt_from_region(const struct tuple *stmt)
+{
+	return ((const struct vy_stmt *) stmt)->flags & VY_REGION_MEMORY;
 }
 
 /**

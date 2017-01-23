@@ -576,7 +576,7 @@ struct vy_index {
 	 * create vinyl 'full delete' statements.
 	 * @sa enum vy_stmt_special_type.
 	 */
-        struct key_def *key_def_tuple_to_delete;
+	struct key_def *key_def_tuple_to_delete;
 
 	/** Member of env->indexes. */
 	struct rlist link;
@@ -1955,7 +1955,7 @@ vy_run_write_page(struct vy_run_info *run_info, struct xlog *data_xlog,
 		end_of_run = *curr_stmt == NULL ||
 			/* Split key reached, proceed to the next run. */
 			     (split_key != NULL &&
-		             vy_stmt_compare_with_key(*curr_stmt, split_key,
+			     vy_stmt_compare_with_key(*curr_stmt, split_key,
 						      key_def) >= 0);
 
 	} while (end_of_run == false &&
@@ -2692,7 +2692,7 @@ vy_index_create(struct vy_index *index)
 		rc = mkdir(index->path, 0777);
 		if (rc == -1 && errno != EEXIST) {
 			diag_set(SystemError, "failed to create directory '%s'",
-		                 index->path);
+				 index->path);
 			*path_sep = '/';
 			return -1;
 		}
@@ -4432,7 +4432,7 @@ vy_index_conf_create(struct vy_index *conf, struct key_def *key_def)
 {
 	char name[128];
 	snprintf(name, sizeof(name), "%" PRIu32 "/%" PRIu32,
-	         key_def->space_id, key_def->iid);
+		 key_def->space_id, key_def->iid);
 	conf->name = strdup(name);
 	/* path */
 	if (key_def->opts.path[0] == '\0') {
@@ -5109,7 +5109,7 @@ vy_check_dup_key(struct vy_tx *tx, struct vy_index *idx, const char *key,
 	 * Expect a full tuple as input (secondary key || primary key)
 	 * but use only  the secondary key fields (partial key look
 	 * up) to check for duplicates.
-         */
+	 */
 	assert(part_count == idx->key_def->part_count);
 	if (vy_index_get(tx, idx, key, idx->user_key_def->part_count, &found))
 		return -1;
@@ -6146,7 +6146,7 @@ vy_env_new(void)
 
 	struct slab_cache *slab_cache = cord_slab_cache();
 	mempool_create(&e->cursor_pool, slab_cache,
-	               sizeof(struct vy_cursor));
+		       sizeof(struct vy_cursor));
 	mempool_create(&e->read_task_pool, slab_cache,
 		       sizeof(struct vy_page_read_task));
 	lsregion_create(&e->allocator, slab_cache->arena);
@@ -7621,7 +7621,7 @@ vy_txw_iterator_next_key(struct vy_stmt_iterator *vitr, struct tuple **ret)
 		itr->curr_txv = NULL;
 	if (itr->curr_txv != NULL && itr->iterator_type == ITER_EQ &&
 	    vy_stmt_compare(itr->key, itr->curr_txv->stmt,
-	    		    itr->index->key_def) != 0)
+			    itr->index->key_def) != 0)
 		itr->curr_txv = NULL;
 	if (itr->curr_txv != NULL)
 		*ret = itr->curr_txv->stmt;
@@ -7748,6 +7748,29 @@ struct vy_merge_src {
 	uint32_t front_id;
 	struct tuple *stmt;
 };
+
+/**
+ * If the statement is from region memory then duplicate it with
+ * malloc(), but if it is already the separate memory area then
+ * increase the reference counter.
+ * It is necessary because vy_mem stores its tuples in the
+ * lsregion allocated  area, and lsregion tuples can't be
+ * referenced or unreferenced - they must be duplicated before
+ * return to the user.
+ */
+struct tuple *
+vy_merge_iterator_ref_or_copy(struct tuple *ret)
+{
+	if (! vy_stmt_from_region(ret)) {
+		if (tuple_ref(ret) != 0)
+			return NULL;
+		return ret;
+	}
+	ret = vy_stmt_dup(ret);
+	if (ret != NULL)
+		vy_stmt_set_region(ret, false);
+	return ret;
+}
 
 /**
  * Open the iterator.
@@ -7913,9 +7936,7 @@ vy_merge_iterator_propagate(struct vy_merge_iterator *itr)
 			return rc;
 	}
 	itr->front_id++;
-	if (vy_merge_iterator_check_version(itr))
-		return -2;
-	return 0;
+	return vy_merge_iterator_check_version(itr);
 }
 
 /**
@@ -8000,11 +8021,15 @@ restart:
 		goto restart;
 	if (itr->curr_stmt != NULL)
 		tuple_unref(itr->curr_stmt);
+	if (min_stmt != NULL && vy_stmt_from_region(min_stmt)) {
+		min_stmt = vy_stmt_dup(min_stmt);
+		if (min_stmt == NULL)
+			return -1;
+		vy_stmt_set_region(min_stmt, true);
+	}
 	itr->curr_stmt = min_stmt;
 	*ret = min_stmt;
-	if (vy_merge_iterator_check_version(itr))
-		return -2;
-	return 0;
+	return vy_merge_iterator_check_version(itr);
 }
 
 /**
@@ -8067,13 +8092,14 @@ vy_merge_iterator_locate(struct vy_merge_iterator *itr,
 	}
 	if (itr->curr_stmt != NULL)
 		tuple_unref(itr->curr_stmt);
+	if (min_stmt != NULL) {
+		min_stmt = vy_merge_iterator_ref_or_copy(min_stmt);
+		if (min_stmt == NULL)
+			return -1;
+	}
 	itr->curr_stmt = min_stmt;
-	if (itr->curr_stmt != NULL)
-		tuple_ref(itr->curr_stmt);
 	*ret = min_stmt;
-	if (vy_merge_iterator_check_version(itr))
-		return -2;
-	return 0;
+	return vy_merge_iterator_check_version(itr);
 }
 
 /**
@@ -8116,57 +8142,64 @@ vy_merge_iterator_next_lsn(struct vy_merge_iterator *itr, struct tuple **ret)
 		return vy_merge_iterator_locate(itr, ret);
 	if (itr->curr_src == UINT32_MAX)
 		return 0;
-	struct vy_stmt_iterator *sub_itr = &itr->src[itr->curr_src].iterator;
-	rc = sub_itr->iface->next_lsn(sub_itr, &itr->src[itr->curr_src].stmt);
+	struct vy_merge_src *src = &itr->src[itr->curr_src];
+	struct vy_stmt_iterator *sub_itr = &src->iterator;
+	rc = sub_itr->iface->next_lsn(sub_itr, &src->stmt);
 	if (rc != 0) {
 		return rc;
-	} else if (itr->src[itr->curr_src].stmt) {
-		if (vy_merge_iterator_check_version(itr))
+	} else if (src->stmt != NULL) {
+		if (vy_merge_iterator_check_version(itr) != 0)
 			return -2;
 		if (itr->curr_stmt != NULL)
 			tuple_unref(itr->curr_stmt);
-		itr->curr_stmt = itr->src[itr->curr_src].stmt;
-		tuple_ref(itr->curr_stmt);
+		itr->curr_stmt = vy_merge_iterator_ref_or_copy(src->stmt);
+		if (itr->curr_stmt == NULL)
+			return -1;
 		*ret = itr->curr_stmt;
 		return 0;
 	}
 	for (uint32_t i = itr->curr_src + 1; i < itr->src_count; i++) {
-		if (vy_merge_iterator_check_version(itr))
+		if (vy_merge_iterator_check_version(itr) != 0)
 			return -2;
+		src = &itr->src[i];
 		if (itr->is_in_uniq_opt) {
-			sub_itr = &itr->src[i].iterator;
+			sub_itr = &src->iterator;
 			struct tuple *t;
-			t = itr->src[i].stmt;
+			t = src->stmt;
 			if (t == NULL) {
 				rc = sub_itr->iface->next_lsn(sub_itr,
-							      &itr->src[i].stmt);
+							      &src->stmt);
 				if (rc != 0)
 					return rc;
-				if (itr->src[i].stmt == NULL)
+				if (src->stmt == NULL)
 					continue;
-				t = itr->src[i].stmt;
+				t = src->stmt;
 			}
 			if (vy_stmt_compare(itr->key, t,
 					    itr->index->key_def) == 0) {
-				itr->src[i].front_id = itr->front_id;
+				src->front_id = itr->front_id;
 				itr->curr_src = i;
 				if (itr->curr_stmt != NULL)
 					tuple_unref(itr->curr_stmt);
-				itr->curr_stmt = t;
-				tuple_ref(t);
-				*ret = t;
+				itr->curr_stmt =
+					vy_merge_iterator_ref_or_copy(t);
+				if (itr->curr_stmt == NULL)
+					return -1;
+				*ret = itr->curr_stmt;
 				return 0;
 			}
 
-		} else if (itr->src[i].front_id == itr->front_id) {
-			sub_itr = &itr->src[i].iterator;
+		} else if (src->front_id == itr->front_id) {
+			sub_itr = &src->iterator;
 			itr->curr_src = i;
 			if (itr->curr_stmt != NULL) {
 				tuple_unref(itr->curr_stmt);
 				itr->curr_stmt = NULL;
 			}
-			itr->curr_stmt = itr->src[i].stmt;
-			tuple_ref(itr->curr_stmt);
+			itr->curr_stmt =
+				vy_merge_iterator_ref_or_copy(src->stmt);
+			if (itr->curr_stmt == NULL)
+				return -1;
 			*ret = itr->curr_stmt;
 			return 0;
 		}

@@ -94,7 +94,7 @@ vy_mem_tree_cmp_key(const struct tuple *a, struct tree_mem_key *key,
 #define BPS_TREE_EXTENT_SIZE VY_MEM_TREE_EXTENT_SIZE
 #define BPS_TREE_COMPARE(a, b, key_def) vy_mem_tree_cmp(a, b, key_def)
 #define BPS_TREE_COMPARE_KEY(a, b, key_def) vy_mem_tree_cmp_key(a, b, key_def)
-#define bps_tree_elem_t const struct tuple *
+#define bps_tree_elem_t struct tuple *
 #define bps_tree_key_t struct tree_mem_key *
 #define bps_tree_arg_t const struct key_def *
 #define BPS_TREE_NO_DEBUG
@@ -219,7 +219,7 @@ struct vy_mem_iterator {
 	 * For example, cur_pos can be invalid but curr_stmt can point on a
 	 * valid statement.
 	 */
-	const struct tuple *curr_stmt;
+	struct tuple *curr_stmt;
 	/*
 	 * Copy of the statement returned from one of public methods
 	 * (restore/next_lsn/next_key). Need to store the copy, because can't
