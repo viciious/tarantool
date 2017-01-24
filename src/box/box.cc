@@ -30,6 +30,8 @@
  */
 #include "box/box.h"
 
+#include "cbus.h"
+
 #include <say.h>
 #include <scoped_guard.h>
 #include "iproto.h"
@@ -1411,6 +1413,11 @@ bootstrap(struct vclock *start_vclock)
 static inline void
 box_init(void)
 {
+	/*
+	 * Init cbus and join to it
+	 */
+	cbus_init();
+	cbus_join("tx");
 	tuple_init(cfg_getd("slab_alloc_arena"),
 		   cfg_geti("slab_alloc_minimal"),
 		   cfg_geti("slab_alloc_maximal"),
