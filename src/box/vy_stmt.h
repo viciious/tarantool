@@ -50,6 +50,7 @@ struct xrow_header;
 struct region;
 struct tuple_format;
 struct iovec;
+struct lsregion;
 
 /**
  * There are two groups of statements:
@@ -97,6 +98,26 @@ struct vy_stmt {
 	 * char raw[0];
 	 */
 };
+
+/**
+ * Create the new statement on the log structured allocator.
+ * @param allocator lsregion allocator.
+ * @param alloc_lsn Allocation identifier.
+ * @param format    Format of the statement.
+ * @param bsize     Size of the variable part of the statement. It
+ *                  includes size of MessagePack tuple data and,
+ *                  for upserts, MessagePack array of operations.
+ * @param type      Statement type.
+ * @param lsn       Statement LSN.
+ * @param is_key    True if the statement contains only indexed
+ *                  fields and hasn't offsets table.
+ * @retval not NULL Success.
+ * @retval     NULL Memory error.
+ */
+struct tuple *
+vy_stmt_new_from_lsregion(struct lsregion *allocator, int64_t alloc_lsn,
+			  const struct tuple_format *format, uint32_t bsize,
+			  enum iproto_type type, int64_t lsn, bool is_key);
 
 /** Get LSN of the vinyl statement. */
 static inline int64_t

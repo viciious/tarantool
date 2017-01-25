@@ -38,38 +38,127 @@
 
 #include "diag.h"
 #include <small/region.h>
+#include <small/lsregion.h>
 
 #include "error.h"
 #include "tuple_format.h"
 #include "xrow.h"
 
+/**
+ * Initialize struct vy_stmt.
+ * @param stmt   Vinyl statement to initialize.
+ * @param format Format of the statement.
+ * @param bsize  Size of the variable part of the statement. It
+ *               includes size of MessagePack tuple data and, for
+ *               upserts, MessagePack array of operations.
+ * @param type   Statement type.
+ * @param lsn    Statement LSN.
+ * @param is_key True if the statement contains only indexed
+ *               fields and hasn't offsets table.
+ */
+static inline void
+vy_stmt_create(struct tuple *stmt, const struct tuple_format *format,
+	       uint32_t bsize, enum iproto_type type, int64_t lsn, bool is_key)
+{
+	assert(stmt->format_id == tuple_format_id(format));
+	struct vy_stmt *vystmt = (struct vy_stmt *) stmt;
+	stmt->bsize = bsize;
+	stmt->data_offset = sizeof(struct vy_stmt) +
+			    /* Space for offsets table field. */
+			    (is_key ? 0 : format->field_map_size);
+	vystmt->type = type;
+	vystmt->lsn = lsn;
+}
+
+struct tuple *
+vy_stmt_new_from_lsregion(struct lsregion *allocator, int64_t alloc_lsn,
+			  const struct tuple_format *format, uint32_t bsize,
+			  enum iproto_type type, int64_t lsn, bool is_key)
+{
+	uint32_t total = bsize + sizeof(struct vy_stmt) +
+			 /* Space for offsets table field. */
+			 (is_key ? 0 : format->field_map_size);
+	struct tuple *tuple = lsregion_alloc(allocator, total, alloc_lsn);
+	if (tuple == NULL) {
+		diag_set(OutOfMemory, total, "lsregion_alloc", "tuple");
+		return NULL;
+	}
+	/*
+	 * Region allocated statements can't be referenced or
+	 * unreferenced because they are located in monolithic
+	 * memory region. Referencing has sense only for
+	 * separately allocated memory blocks. The reference count
+	 * here is set to 0 for an assertion if somebody will try
+	 * to unreference this statement.
+	 */
+	tuple->refs = 0;
+	tuple->format_id = tuple_format_id(format);
+	vy_stmt_create(tuple, format, bsize, type, lsn, is_key);
+	return tuple;
+}
+
+/**
+ * Allocate and initialize a vinyl statement object on base of the
+ * struct tuple with malloc() and the reference counter equal to 1.
+ * @param format Format of the statement.
+ * @param bsize  Size of the variable part of the statement. It
+ *               includes size of MessagePack tuple data and, for
+ *               upserts, MessagePack array of operations.
+ * @param type   Statement type.
+ * @param lsn    Statement LSN.
+ * @param is_key True if the statement contains only indexed
+ *               fields and hasn't offsets table.
+ * @retval not NULL Success.
+ * @retval     NULL Memory error.
+ */
+static struct tuple *
+vy_stmt_new(struct tuple_format *format, uint32_t bsize, enum iproto_type type,
+	    int64_t lsn, bool is_key)
+{
+	uint32_t total = bsize + sizeof(struct vy_stmt) +
+			 /* Space for offsets table field. */
+			 (is_key ? 0 : format->field_map_size);
+	struct tuple *tuple = malloc(total);
+	if (unlikely(tuple == NULL)) {
+		diag_set(OutOfMemory, total, "malloc", "tuple");
+		return NULL;
+	}
+	tuple->refs = 1;
+	tuple->format_id = tuple_format_id(format);
+	tuple_format_ref(format, 1);
+	vy_stmt_create(tuple, format, bsize, type, lsn, is_key);
+	return tuple;
+}
+
+/**
+ * Tuple format vtable version of the vy_stmt_new().
+ * @param format Format of the statement.
+ * @param data   MessagePack array of tuple fields.
+ * @param end    End of the data.
+ *
+ * @retval not NULL Success.
+ * @retval     NULL Memory error.
+ */
 struct tuple *
 vy_tuple_new(struct tuple_format *format, const char *data, const char *end)
 {
 	size_t tuple_len = end - data;
 	assert(mp_typeof(*data) == MP_ARRAY);
-	uint32_t total =
-		tuple_len + sizeof(struct vy_stmt) + format->field_map_size;
-	struct tuple *new_tuple = malloc(total);
-	if (new_tuple == NULL) {
-		diag_set(OutOfMemory, total, "malloc", "struct tuple");
+	struct tuple *new_tuple = vy_stmt_new(format, tuple_len, 0, 0, false);
+	if (new_tuple == NULL)
 		return NULL;
-	}
-	new_tuple->bsize = tuple_len;
-	new_tuple->format_id = tuple_format_id(format);
-	tuple_format_ref(format, 1);
-	new_tuple->data_offset = sizeof(struct vy_stmt) + format->field_map_size;
 	char *raw = (char *) new_tuple + new_tuple->data_offset;
 	uint32_t *field_map = (uint32_t *) raw;
 	memcpy(raw, data, tuple_len);
 	if (tuple_init_field_map(format, field_map, raw)) {
-		vy_tuple_delete(format, new_tuple);
+		tuple_unref(new_tuple);
 		return NULL;
 	}
 	new_tuple->refs = 0;
 	return new_tuple;
 }
 
+/** Tuple format vtable deleter of the vinyl statements. */
 void
 vy_tuple_delete(struct tuple_format *format, struct tuple *tuple)
 {
@@ -82,51 +171,22 @@ vy_tuple_delete(struct tuple_format *format, struct tuple *tuple)
 	free(tuple);
 }
 
-/**
- * Allocate a vinyl statement object on base of the struct tuple
- * with malloc() and the reference counter equal to 1.
- * @param format Format of an index.
- * @param size   Size of the variable part of the statement. It
- *               includes size of MessagePack tuple data and, for
- *               upserts, MessagePack array of operations.
- * @retval not NULL Success.
- * @retval     NULL Memory error.
- */
-struct tuple *
-vy_stmt_alloc(struct tuple_format *format, uint32_t size)
-{
-	struct tuple *tuple = malloc(sizeof(struct vy_stmt) + size);
-	if (unlikely(tuple == NULL)) {
-		diag_set(OutOfMemory, sizeof(struct vy_stmt) + size,
-			 "malloc", "struct vy_stmt");
-		return NULL;
-	}
-	tuple->refs = 1;
-	tuple->format_id = tuple_format_id(format);
-	tuple_format_ref(format, 1);
-	tuple->bsize = 0;
-	tuple->data_offset = 0;
-	vy_stmt_set_lsn(tuple, 0);
-	vy_stmt_set_type(tuple, 0);
-	vy_stmt_set_n_upserts(tuple, 0);
-	return tuple;
-}
-
 struct tuple *
 vy_stmt_dup(const struct tuple *stmt)
 {
 	/*
-	 * Need to subtract sizeof(struct tuple), because
-	 * vy_stmt_alloc adds it.
 	 * We don't use tuple_new() to avoid the initializing of
 	 * tuple field map. This map can be simple memcopied from
 	 * the original tuple.
 	 */
 	uint32_t size = tuple_size(stmt);
-	struct tuple *res = vy_stmt_alloc(tuple_format_by_id(stmt->format_id),
-					  size - sizeof(struct vy_stmt));
-	if (res == NULL)
+	struct tuple *res = malloc(size);
+	if (res == NULL) {
+		diag_set(OutOfMemory, size, "malloc", "res");
 		return NULL;
+	}
+	struct tuple_format *format = tuple_format(stmt);
+	tuple_format_ref(format, 1);
 	memcpy(res, stmt, size);
 	res->refs = 1;
 	return res;
@@ -158,17 +218,14 @@ vy_stmt_new_key(struct tuple_format *format, const char *key,
 	/* Allocate stmt */
 	uint32_t key_size = key_end - key;
 	uint32_t size = mp_sizeof_array(part_count) + key_size;
-	struct tuple *stmt = vy_stmt_alloc(format, size);
+	struct tuple *stmt = vy_stmt_new(format, size, type, 0, true);
 	if (stmt == NULL)
 		return NULL;
-	stmt->data_offset = sizeof(struct vy_stmt);
-	stmt->bsize = size;
 	/* Copy MsgPack data */
 	char *raw = (char *) stmt + sizeof(struct vy_stmt);
 	char *data = mp_encode_array(raw, part_count);
 	memcpy(data, key, key_size);
 	assert(data + key_size == raw + size);
-	vy_stmt_set_type(stmt, type);
 	return stmt;
 }
 
@@ -186,59 +243,45 @@ vy_stmt_new_delete(struct tuple_format *format, const char *key,
 	return vy_stmt_new_key(format, key, part_count, IPROTO_DELETE);
 }
 
-/**
- * Create a statement without type and with reserved space for operations.
- * Operations can be saved in the space available by @param extra.
- * For details @sa struct vy_stmt comment.
- */
 struct tuple *
-vy_stmt_new_with_ops(const char *tuple_begin, const char *tuple_end,
-		     uint8_t type, struct tuple_format *format,
-		     uint32_t part_count,
-		     struct iovec *operations, uint32_t iovcnt)
+vy_stmt_new_upsert(const char *tuple_begin, const char *tuple_end,
+		   struct tuple_format *format, uint32_t part_count,
+		   struct iovec *operations, uint32_t ops_cnt)
 {
 	(void) part_count; /* unused in release. */
 #ifndef NDEBUG
-	const char *tuple_end_must_be = tuple_begin;
-	mp_next(&tuple_end_must_be);
-	assert(tuple_end == tuple_end_must_be);
-#endif
-
-	uint32_t field_count = mp_decode_array(&tuple_begin);
+	const char *tuple_check_pos = tuple_begin;
+	mp_next(&tuple_check_pos);
+	assert(tuple_end == tuple_check_pos);
+	tuple_check_pos = tuple_begin;
+	uint32_t field_count = mp_decode_array(&tuple_check_pos);
 	assert(field_count >= part_count);
-
-	uint32_t extra_size = 0;
-	for (uint32_t i = 0; i < iovcnt; ++i) {
-		extra_size += operations[i].iov_len;
-	}
+#endif
+	uint32_t ops_size = 0;
+	for (uint32_t i = 0; i < ops_cnt; ++i)
+		ops_size += operations[i].iov_len;
 
 	/*
 	 * Allocate stmt. Offsets: one per key part + offset of the
 	 * statement end.
 	 */
-	uint32_t offsets_size = format->field_map_size;
 	uint32_t bsize = tuple_end - tuple_begin;
-	uint32_t size = offsets_size + mp_sizeof_array(field_count) +
-			bsize + extra_size;
-	struct tuple *stmt = vy_stmt_alloc(format, size);
+	struct tuple *stmt = vy_stmt_new(format, bsize + ops_size,
+					 IPROTO_UPSERT, 0, false);
 	if (stmt == NULL)
 		return NULL;
-	stmt->bsize = bsize +  mp_sizeof_array(field_count);
 	/* Copy MsgPack data */
-	stmt->data_offset = offsets_size + sizeof(struct vy_stmt);
 	char *raw = (char *) stmt + stmt->data_offset;
-	char *wpos = mp_encode_array(raw, field_count);
+	char *wpos = raw;
 	memcpy(wpos, tuple_begin, bsize);
 	wpos += bsize;
-	assert(wpos == raw + stmt->bsize);
-	for (struct iovec *op = operations, *end = operations + iovcnt;
+	assert(wpos == raw + bsize);
+	for (struct iovec *op = operations, *end = operations + ops_cnt;
 	     op != end; ++op) {
 
 		memcpy(wpos, op->iov_base, op->iov_len);
 		wpos += op->iov_len;
 	}
-	stmt->bsize += extra_size;
-	vy_stmt_set_type(stmt, type);
 
 	/* Calculate offsets for key parts */
 	if (tuple_init_field_map(format, (uint32_t *) raw, raw)) {
@@ -249,20 +292,33 @@ vy_stmt_new_with_ops(const char *tuple_begin, const char *tuple_end,
 }
 
 struct tuple *
-vy_stmt_new_upsert(const char *tuple_begin, const char *tuple_end,
-		   struct tuple_format *format, uint32_t part_count,
-		   struct iovec *operations, uint32_t ops_cnt)
-{
-	return vy_stmt_new_with_ops(tuple_begin, tuple_end, IPROTO_UPSERT,
-				    format, part_count, operations, ops_cnt);
-}
-
-struct tuple *
 vy_stmt_new_replace(const char *tuple_begin, const char *tuple_end,
 		    struct tuple_format *format, uint32_t part_count)
 {
-	return vy_stmt_new_with_ops(tuple_begin, tuple_end, IPROTO_REPLACE,
-				    format, part_count, NULL, 0);
+	(void) part_count; /* unused in release. */
+#ifndef NDEBUG
+	const char *tuple_check_pos = tuple_begin;
+	mp_next(&tuple_check_pos);
+	assert(tuple_end == tuple_check_pos);
+	tuple_check_pos = tuple_begin;
+	uint32_t field_count = mp_decode_array(&tuple_check_pos);
+	assert(field_count >= part_count);
+#endif
+	uint32_t bsize = tuple_end - tuple_begin;
+	struct tuple *stmt = vy_stmt_new(format, bsize, IPROTO_REPLACE, 0,
+					 false);
+	if (stmt == NULL)
+		return NULL;
+	/* Copy MsgPack data */
+	char *raw = (char *) stmt + stmt->data_offset;
+	memcpy(raw, tuple_begin, bsize);
+
+	/* Calculate offsets for key parts */
+	if (tuple_init_field_map(format, (uint32_t *) raw, raw)) {
+		tuple_unref(stmt);
+		return NULL;
+	}
+	return stmt;
 }
 
 struct tuple *
@@ -273,19 +329,17 @@ vy_stmt_replace_from_upsert(const struct tuple *upsert)
 	uint32_t bsize;
 	vy_upsert_data_range(upsert, &bsize);
 	assert(bsize <= upsert->bsize);
-	uint32_t size = bsize + upsert->data_offset - sizeof(struct vy_stmt);
+	struct tuple_format *format = tuple_format_by_id(upsert->format_id);
 
 	/* Copy statement data excluding UPSERT operations */
-	struct tuple *replace =
-		vy_stmt_alloc(tuple_format_by_id(upsert->format_id), size);
+	struct tuple *replace = vy_stmt_new(format, bsize, IPROTO_REPLACE,
+					    vy_stmt_lsn(upsert), false);
 	if (replace == NULL)
 		return NULL;
-	memcpy((char *) replace + sizeof(struct vy_stmt),
-	       (char *) upsert + sizeof(struct vy_stmt), size);
-	replace->bsize = bsize;
-	vy_stmt_set_type(replace, IPROTO_REPLACE);
-	vy_stmt_set_lsn(replace, vy_stmt_lsn(upsert));
-	replace->data_offset = upsert->data_offset;
+	uint32_t offsets_size = format->field_map_size;
+	uint32_t size = bsize + offsets_size;
+	memcpy((char *) replace + replace->data_offset - offsets_size,
+	       (char *) upsert + upsert->data_offset - offsets_size, size);
 	return replace;
 }
 
@@ -311,14 +365,12 @@ vy_stmt_extract_key(const struct tuple *stmt, const struct key_def *key_def,
 	char *key = tuple_extract_key(stmt, key_def, &size);
 	if (key == NULL)
 		goto error;
-	struct tuple *ret = vy_stmt_alloc(format, size);
+	struct tuple *ret = vy_stmt_new(format, size, IPROTO_SELECT,
+					vy_stmt_lsn(stmt), true);
 	if (ret == NULL)
 		goto error;
-	memcpy((char *) ret + sizeof(struct vy_stmt), key, size);
+	memcpy((char *) ret + ret->data_offset, key, size);
 	region_truncate(region, region_svp);
-	vy_stmt_set_type(ret, IPROTO_SELECT);
-	ret->data_offset = sizeof(struct vy_stmt);
-	ret->bsize = size;
 	return ret;
 error:
 	region_truncate(region, region_svp);

@@ -114,21 +114,16 @@ vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt,
 	      int64_t alloc_lsn)
 {
 	size_t size = tuple_size(stmt);
-	struct tuple *mem_stmt;
-	mem_stmt = lsregion_alloc(mem->allocator, size, alloc_lsn);
-	if (mem_stmt == NULL) {
-		diag_set(OutOfMemory, size, "lsregion_alloc", "mem_stmt");
+	struct tuple_format *format = tuple_format(stmt);
+	enum iproto_type type = vy_stmt_type(stmt);
+	bool is_key = type == IPROTO_SELECT || type == IPROTO_DELETE;
+	struct tuple *mem_stmt =
+		vy_stmt_new_from_lsregion(mem->allocator, alloc_lsn, format,
+					  stmt->bsize, type, vy_stmt_lsn(stmt),
+					  is_key);
+	if (mem_stmt == NULL)
 		return -1;
-	}
 	memcpy(mem_stmt, stmt, size);
-	/*
-	 * Region allocated statements can't be referenced or unreferenced
-	 * because they are located in monolithic memory region. Referencing has
-	 * sense only for separately allocated memory blocks.
-	 * The reference count here is set to 0 for an assertion if somebody
-	 * will try to unreference this statement.
-	 */
-	mem_stmt->refs = 0;
 
 	const struct tuple *replaced_stmt = NULL;
 	int rc = vy_mem_tree_insert(&mem->tree, mem_stmt, &replaced_stmt);
