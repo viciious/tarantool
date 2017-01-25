@@ -453,18 +453,6 @@ struct key_def *
 key_def_build_secondary_to_primary(const struct key_def *primary,
 				   const struct key_def *secondary);
 
-/**
- * Create a key def with a set union of primary and secondary
- * keys, used to compare such keys between each other. This
- * key_def describes how the index is stored in the engine.
- *
- * @retval not NULL Ok.
- * @retval NULL     Memory error.
- */
-struct key_def *
-key_def_build_secondary(const struct key_def *primary,
-			const struct key_def *secondary);
-
 /*
  * Check that parts of the key match with the key definition.
  * @param key_def Key definition.

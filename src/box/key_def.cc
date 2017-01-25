@@ -421,24 +421,6 @@ key_def_build_secondary_to_primary(const struct key_def *primary,
 	return def;
 }
 
-struct key_def *
-key_def_build_secondary(const struct key_def *primary,
-			const struct key_def *secondary)
-{
-	struct key_def *merge = key_def_merge(secondary, primary);
-	if (merge == NULL)
-		return NULL;
-	/*
-	 * Renumber key parts, since they are stored consequently
-	 * in the secondary index.
-	 */
-	struct key_part *part = merge->parts;
-	struct key_part *end = part + merge->part_count;
-	for (; part != end; part++)
-		part->fieldno = part - merge->parts;
-	return merge;
-}
-
 int
 key_validate_parts(struct key_def *key_def, const char *key,
 		   uint32_t part_count)

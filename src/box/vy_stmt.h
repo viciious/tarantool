@@ -54,49 +54,82 @@ struct iovec;
 /**
  * There are two groups of statements:
  *
- *  - SELECT and DELETE are "key" statements.
- *  - DELETE, UPSERT and REPLACE are "tuple" statements.
+ *  - SELECT, DELETE and REPLACE in secondary indexes are "key"
+ *    statements.
+ *  - UPSERT and REPLACE in a primary index are "tuple"
+ *    statements.
  *
- * REPLACE/UPSERT statements structure:
- *                               data_offset
- *                                    ^
- * +----------------------------------+
- * |               4 bytes      4 bytes     MessagePack data.
- * |               +------+----+------+---------------------------+- - - - - - .
- *tuple, ..., raw: | offN | .. | off1 | header ..|key1|..|keyN|.. | operations |
- *                 +--+---+----+--+---+---------------------------+- - - - - - .
- *                 |     ...    |                 ^       ^
- *                 |            +-----------------+       |
- *                 +--------------------------------------+
- * Offsets are stored only for indexed fields, though MessagePack'ed tuple data
- * can contain also not indexed fields. For example, if fields 3 and 5 are
- * indexed then before MessagePack data are stored offsets only for field 3 and
- * field 5.
+ * Statements structure:
+ *                                  data_offset
+ *                                      ^
+ * +------------------------------------+
+ * |      1 - 8 byte  4 bytes                 MessagePack data
+ * |     . - - - - - + - - -+ - -+ - - -+--------------+- - - - - - .
+ *tuple: | type data | offN | .. | off1 | fields array | operations |
+ *       . - - - - - + -+ - + - -+ -+ - +--------------+- - - - - - .
+ *                      |     ...   |       ^     ^
+ *                      |           +-------+     |
+ *                      +-------------------------+
+ * 'Type data' contains 1 byte for 'n_upserts' field, if the
+ * statement has UPSERT type.
+ * n_upserts is number of UPSERT statements for the same key
+ * preceding this statement. Used to trigger upsert squashing in
+ * the background. @sa vy_range_set_upsert().
  *
- * SELECT/DELETE statements structure.
- * +--------------+-----------------+
- * | array header | part1 ... partN |  -  MessagePack data
- * +--------------+-----------------+
+ * Also 'type data' can contain 8 bytes
+ * for column mask of UPDATE operation (@sa vy_can_skip_update()).
  *
- * Field 'operations' is used for storing operations of UPSERT statement.
+ * Offsets are stored only for indexed fields in primary index
+ * tuples. (For format @sa tuple_format.h)
+ * Field 'operations' is used to store operations of UPSERT
+ * statements.
  */
 struct vy_stmt {
 	struct tuple base;
 	int64_t lsn;
-	uint8_t  type; /* IPROTO_SELECT/REPLACE/UPSERT/DELETE */
+	/* IPROTO_SELECT/REPLACE/UPSERT/DELETE */
+	enum iproto_type type:4;
 	/**
-	 * Number of UPSERT statements for the same key preceding
-	 * this statement. Used to trigger upsert squashing in the
-	 * background (see vy_range_set_upsert()).
+	 * Set if the statement contains only key fields without
+	 * offsets. That is such statement can be used in
+	 * comparators as key.
 	 */
-	uint8_t n_upserts;
-	/** Offsets count before MessagePack data. */
+	bool is_key_compatible:1;
 	/**
-	 * Offsets array concatenated with MessagePack fields
-	 * array.
+	 * Set if the statement is DELETE or REPLACE statement
+	 * created during the UPDATE or UPSERT of a space with
+	 * secondary indexes.
+	 */
+	bool has_column_mask:1;
+	/**
+	 * Type specific data, offsets array concatenated with
+	 * MessagePack fields array.
 	 * char raw[0];
 	 */
 };
+
+/**
+ * Initialize struct vy_stmt.
+ * @param stmt              Vinyl statement to initialize.
+ * @param format            Format of the statement.
+ * @param bsize             Size of the variable part of the
+ *                          statement. It includes size of
+ *                          MessagePack tuple data and, for
+ *                          upserts, MessagePack array of
+ *                          operations.
+ * @param type              Statement type.
+ * @param lsn               Statement LSN.
+ * @param is_key_compatible True if the statement contains only
+ *                          indexed fields and hasn't offsets
+ *                          table.
+ * @param has_column_mask   True if the statement has 8 byte
+ *                          column mask right after last struct
+ *                          field and before offsets table.
+ */
+void
+vy_stmt_create(struct tuple *stmt, const struct tuple_format *format,
+	       uint32_t bsize, enum iproto_type type, int64_t lsn,
+	       bool is_key_compatible, bool has_column_mask);
 
 /** Get LSN of the vinyl statement. */
 static inline int64_t
@@ -113,7 +146,7 @@ vy_stmt_set_lsn(struct tuple *stmt, int64_t lsn)
 }
 
 /** Get type of the vinyl statement. */
-static inline uint8_t
+static inline enum iproto_type
 vy_stmt_type(const struct tuple *stmt)
 {
 	return ((const struct vy_stmt *) stmt)->type;
@@ -121,7 +154,7 @@ vy_stmt_type(const struct tuple *stmt)
 
 /** Set type of the vinyl statement. */
 static inline void
-vy_stmt_set_type(struct tuple *stmt, uint8_t type)
+vy_stmt_set_type(struct tuple *stmt, enum iproto_type type)
 {
 	((struct vy_stmt *) stmt)->type = type;
 }
@@ -130,14 +163,63 @@ vy_stmt_set_type(struct tuple *stmt, uint8_t type)
 static inline uint8_t
 vy_stmt_n_upserts(const struct tuple *stmt)
 {
-	return ((const struct vy_stmt *) stmt)->n_upserts;
+	assert(vy_stmt_type(stmt) == IPROTO_UPSERT);
+	return *((const uint8_t *) stmt + sizeof(struct vy_stmt));
 }
 
 /** Set upserts count of the vinyl statement. */
 static inline void
 vy_stmt_set_n_upserts(struct tuple *stmt, uint8_t n)
 {
-	((struct vy_stmt *) stmt)->n_upserts = n;
+	assert(vy_stmt_type(stmt) == IPROTO_UPSERT);
+	*((uint8_t *) stmt + sizeof(struct vy_stmt)) = n;
+}
+
+/** Return true, if the statement can be treated as key. */
+static inline bool
+vy_stmt_key_compatible(const struct tuple *stmt)
+{
+	return ((const struct vy_stmt *) stmt)->is_key_compatible;
+}
+
+/**
+ * Return true if the statement is part of an UPDATE operation.
+ */
+static inline bool
+vy_stmt_has_column_mask(const struct tuple *stmt)
+{
+	return ((const struct vy_stmt *) stmt)->has_column_mask;
+}
+
+/**
+ * Set column mask for the statement, that is part of an UPDATE
+ * statement.
+ */
+static inline void
+vy_stmt_set_column_mask(struct tuple *stmt, uint64_t mask)
+{
+	assert(vy_stmt_has_column_mask(stmt));
+	*((uint64_t *) ((char *) stmt + sizeof(struct vy_stmt))) = mask;
+}
+
+/**
+ * Get column mask of the statement that is part of an UPDATE
+ * statement.
+ */
+static inline uint64_t
+vy_stmt_column_mask(const struct tuple *stmt)
+{
+	assert(vy_stmt_has_column_mask(stmt));
+	return *((const uint64_t *) ((const char *) stmt +
+				     sizeof(struct vy_stmt)));
+}
+
+/** Return MessagePack array with key fields of the statement. */
+static inline const char *
+vy_stmt_cast_to_key(const struct tuple *stmt)
+{
+	assert(vy_stmt_key_compatible(stmt));
+	return tuple_data(stmt);
 }
 
 /** Create a tuple in the vinyl engine format. @sa tuple_new(). */
@@ -193,12 +275,9 @@ static inline int
 vy_key_compare(const struct tuple *a, const struct tuple *b,
 	       const struct key_def *key_def)
 {
-	assert(vy_stmt_type(a) == IPROTO_SELECT ||
-	       vy_stmt_type(a) == IPROTO_DELETE);
-	assert(vy_stmt_type(b) == IPROTO_SELECT ||
-	       vy_stmt_type(b) == IPROTO_DELETE);
-	return vy_key_compare_raw((const char *) a + a->data_offset,
-				  (const char *) b + b->data_offset, key_def);
+	assert(vy_stmt_key_compatible(a) && vy_stmt_key_compatible(b));
+	return vy_key_compare_raw(vy_stmt_cast_to_key(a),
+				  vy_stmt_cast_to_key(b), key_def);
 }
 
 /**
@@ -215,10 +294,7 @@ static inline int
 vy_tuple_compare(const struct tuple *a, const struct tuple *b,
 		 const struct key_def *key_def)
 {
-	assert(vy_stmt_type(a) == IPROTO_REPLACE ||
-	       vy_stmt_type(a) == IPROTO_UPSERT);
-	assert(vy_stmt_type(b) == IPROTO_REPLACE ||
-	       vy_stmt_type(b) == IPROTO_UPSERT);
+	assert(!vy_stmt_key_compatible(a) && !vy_stmt_key_compatible(b));
 	return tuple_compare_default(a, b, key_def);
 }
 
@@ -237,7 +313,8 @@ static inline int
 vy_tuple_compare_with_key(const struct tuple *tuple, const struct tuple *key,
 			  const struct key_def *key_def)
 {
-	const char *key_mp = tuple_data(key);
+	assert(!vy_stmt_key_compatible(tuple) && vy_stmt_key_compatible(key));
+	const char *key_mp = vy_stmt_cast_to_key(key);
 	uint32_t part_count = mp_decode_array(&key_mp);
 	return tuple_compare_with_key_default(tuple, key_mp, part_count,
 					      key_def);
@@ -248,10 +325,8 @@ static inline int
 vy_stmt_compare(const struct tuple *a, const struct tuple *b,
 		const struct key_def *key_def)
 {
-	bool a_is_tuple = vy_stmt_type(a) == IPROTO_REPLACE ||
-			  vy_stmt_type(a) == IPROTO_UPSERT;
-	bool b_is_tuple = vy_stmt_type(b) == IPROTO_REPLACE ||
-			  vy_stmt_type(b) == IPROTO_UPSERT;
+	bool a_is_tuple = !vy_stmt_key_compatible(a);
+	bool b_is_tuple = !vy_stmt_key_compatible(b);
 	if (a_is_tuple && b_is_tuple) {
 		return vy_tuple_compare(a, b, key_def);
 	} else if (a_is_tuple && !b_is_tuple) {
@@ -269,10 +344,8 @@ static inline int
 vy_stmt_compare_with_key(const struct tuple *stmt, const struct tuple *key,
 			 const struct key_def *key_def)
 {
-	assert(vy_stmt_type(key) == IPROTO_SELECT ||
-	       vy_stmt_type(key) == IPROTO_DELETE);
-	if (vy_stmt_type(stmt) == IPROTO_REPLACE ||
-	    vy_stmt_type(stmt) == IPROTO_UPSERT)
+	assert(vy_stmt_key_compatible(key));
+	if (! vy_stmt_key_compatible(stmt))
 		return vy_tuple_compare_with_key(stmt, key, key_def);
 	return vy_key_compare(stmt, key, key_def);
 }
@@ -293,36 +366,25 @@ vy_stmt_new_select(struct tuple_format *format, const char *key,
 		   uint32_t part_count);
 
 /**
- * Create the DELETE statement from raw MessagePack data.
- * @param format     Format of an index.
- * @param key        MessagePack data that contain an array of
- *                   fields WITHOUT the array header.
- * @param part_count Count of the key fields that will be saved as
- *                   result.
- *
- * @retval NULL     Memory allocation error.
- * @retval not NULL Success.
- */
-struct tuple *
-vy_stmt_new_delete(struct tuple_format *format, const char *key,
-		   uint32_t part_count);
-
-/**
  * Create the REPLACE statement from raw MessagePack data.
- * @param tuple_begin MessagePack data that contain an array of fields WITH the
- *                    array header.
- * @param tuple_end End of the array that begins from @param tuple_begin.
- * @param format Format of a tuple for offsets generating.
- * @param part_count Part count from key definition.
- *
+ * @param tuple_begin     MessagePack data that contain an array
+ *                        of fields WITH the array header.
+ * @param tuple_end       End of the array that begins from
+ *                        \a tuple_begin.
+ * @param format          Format of a tuple for offsets generating.
+ * @param part_count      Part count from key definition.
+ * @param has_column_mask True if the statement has 8 byte column
+ *                        mask right after last struct field and
+ *                        before offsets table.
  * @retval NULL     Memory allocation error.
  * @retval not NULL Success.
  */
 struct tuple *
 vy_stmt_new_replace(const char *tuple_begin, const char *tuple_end,
-		    struct tuple_format *format, uint32_t part_count);
+		    struct tuple_format *format, uint32_t part_count,
+		    bool has_column_mask);
 
- /**
+/**
  * Create the UPSERT statement from raw MessagePack data.
  * @param tuple_begin MessagePack data that contain an array of fields WITH the
  *                    array header.
@@ -388,39 +450,51 @@ vy_stmt_upsert_ops(const struct tuple *tuple, uint32_t *mp_size)
 }
 
 /**
- * Extract a SELECT statement with only indexed fields from raw data.
- * @param stmt Raw data of struct vy_stmt.
- * @param key_def key definition.
- * @param a region for temporary allocations. Automatically shrinked
- * to the original size.
+ * Extract the key compatible statement from raw data.
+ * @param stmt    Raw data of struct vy_stmt.
+ * @param key_def Key definition.
+ * @param gc      Region for temporary allocations. Automatically
+ *                shrinked to the original size.
+ * @param type    Type of the new statement.
  *
  * @retval not NULL Success.
  * @retval NULL Memory allocation error.
  */
 struct tuple *
 vy_stmt_extract_key(const struct tuple *stmt, const struct key_def *key_def,
-		    struct region *gc);
+		    struct region *gc, enum iproto_type type);
 
 /**
- * Create the SELECT statement from MessagePack array.
+ * Extract the new statement with all indexed fields of the
+ * specified statement. Such statements contains offsets table and
+ * is not key compatible.
+ * @sa vy_update(), vy_upsert().
+ * @param format          Format of the statement.
+ * @param tuple           Vinyl statement to extract the full key.
+ * @param type            Type of the new statement.
+ * @param has_column_mask True if the statement has 8 byte column
+ *                        mask right after last struct field and
+ *                        before offsets table.
+ * @retval not NULL Success.
+ * @retval     NULL Memory error.
+ */
+struct tuple *
+vy_stmt_extract_full_key(struct tuple_format *format, const struct tuple *tuple,
+			 enum iproto_type type, bool has_column_mask);
+
+/**
+ * Create the key_compatible statement from MessagePack array.
  * @param format  Format of an index.
  * @param key     MessagePack array of key fields.
  * @param key_def Definition of the key.
+ * @param type    Type of the result statement.
  *
  * @retval not NULL Success.
  * @retval     NULL Memory error.
  */
-static inline struct tuple *
-vy_key_from_msgpack(struct tuple_format *format, const char *key)
-{
-	uint32_t part_count;
-	/*
-	 * The statement already is a key, so simply copy it in
-	 * the new struct vy_stmt as SELECT.
-	 */
-	part_count = mp_decode_array(&key);
-	return vy_stmt_new_select(format, key, part_count);
-}
+struct tuple *
+vy_key_from_msgpack(struct tuple_format *format, const char *key,
+		    enum iproto_type type);
 
 /**
  * Encode vy_stmt as xrow_header
