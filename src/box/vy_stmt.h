@@ -399,7 +399,22 @@ vy_stmt_upsert_ops(const struct tuple *tuple, uint32_t *mp_size)
  */
 struct tuple *
 vy_stmt_extract_key(const struct tuple *stmt, const struct key_def *key_def,
-		    struct region *gc);
+		    struct region *gc, enum iproto_type type);
+
+/**
+ * Extract the new statement with all indexed fields of the
+ * specified statement. Such statements contains offsets table and
+ * is not key compatible.
+ * @sa vy_update(), vy_upsert().
+ * @param format Format of the statement.
+ * @param tuple  Vinyl statement to extract the full key.
+ * @param type   Type of the new statement.
+ * @retval not NULL Success.
+ * @retval     NULL Memory error.
+ */
+struct tuple *
+vy_stmt_extract_full_key(struct tuple_format *format, const struct tuple *tuple,
+			 enum iproto_type type);
 
 /**
  * Create the SELECT statement from MessagePack array.
@@ -410,17 +425,9 @@ vy_stmt_extract_key(const struct tuple *stmt, const struct key_def *key_def,
  * @retval not NULL Success.
  * @retval     NULL Memory error.
  */
-static inline struct tuple *
-vy_key_from_msgpack(struct tuple_format *format, const char *key)
-{
-	uint32_t part_count;
-	/*
-	 * The statement already is a key, so simply copy it in
-	 * the new struct vy_stmt as SELECT.
-	 */
-	part_count = mp_decode_array(&key);
-	return vy_stmt_new_select(format, key, part_count);
-}
+struct tuple *
+vy_key_from_msgpack(struct tuple_format *format, const char *key,
+		    enum iproto_type type);
 
 /**
  * Encode vy_stmt as xrow_header

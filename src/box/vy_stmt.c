@@ -290,25 +290,81 @@ vy_stmt_replace_from_upsert(const struct tuple *upsert)
 }
 
 struct tuple *
-vy_stmt_extract_key(const struct tuple *stmt, const struct key_def *key_def,
-		    struct region *region)
+vy_stmt_extract_full_key(struct tuple_format *format, const struct tuple *tuple,
+			 enum iproto_type type)
 {
-	enum iproto_type type = vy_stmt_type(stmt);
-	struct tuple_format *format = tuple_format_by_id(stmt->format_id);
-	if (type == IPROTO_SELECT || type == IPROTO_DELETE) {
-		/*
-		 * The statement already is a key, so simply copy it in new
-		 * struct vy_stmt as SELECT.
-		 */
-		struct tuple *res = vy_stmt_dup(stmt);
-		if (res != NULL)
-			vy_stmt_set_type(res, IPROTO_SELECT);
-		return res;
+	assert(vy_stmt_type(tuple) == IPROTO_REPLACE ||
+	       vy_stmt_type(tuple) == IPROTO_UPSERT);
+	const char *begin, *end, *data = tuple_data(tuple);
+	const uint32_t *cfield_map = tuple_field_map(tuple);
+	uint32_t bsize = 0;
+	uint32_t part_count = 0;
+
+	/* Calculate size of the full key. */
+	for (uint32_t i = 0; i < format->field_count; ++i) {
+		struct tuple_field_format *field = &format->fields[i];
+		if (field->type == FIELD_TYPE_ANY)
+			continue;
+		begin = tuple_field_raw(format, data, cfield_map, i);
+		end = begin;
+		mp_next(&end);
+		bsize += end - begin;
+		++part_count;
 	}
-	assert(type == IPROTO_REPLACE || type == IPROTO_UPSERT);
+	struct tuple *full_key = vy_stmt_alloc(format,
+					       bsize + format->field_map_size);
+	if (full_key == NULL)
+		return NULL;
+	full_key->bsize = bsize;
+	full_key->data_offset = sizeof(struct vy_stmt) + format->field_map_size;
+	vy_stmt_set_lsn(full_key, vy_stmt_lsn(tuple));
+	vy_stmt_set_type(full_key, type);
+	/* Fill offsets table and key fields. */
+	char *raw_key = (char *) full_key + full_key->data_offset;
+	uint32_t *field_map = (uint32_t *) raw_key;
+	char *pos = mp_encode_array(raw_key, part_count);;
+	mp_decode_array(&data);
+	for (uint32_t i = 0; i < format->field_count; ++i) {
+		struct tuple_field_format *field = &format->fields[i];
+		if (field->type == FIELD_TYPE_ANY) {
+			mp_next(&data);
+			continue;
+		}
+		begin = data;
+		mp_next(&data);
+		bsize = data - begin;
+		memcpy(pos, begin, bsize);
+		/*
+		 * If the first field of the statement is indexed
+		 * then no need to store offset to it.
+		 * @sa tuple_init_field_map().
+		 */
+		if (i > 0)
+			field_map[field->offset_slot] =
+				(uint32_t) (pos - raw_key);
+		pos += bsize;
+	}
+	return full_key;
+}
+
+struct tuple *
+vy_stmt_extract_key(const struct tuple *stmt, const struct key_def *key_def,
+		    struct region *region, enum iproto_type type)
+{
+	enum iproto_type src_type = vy_stmt_type(stmt);
+	struct tuple_format *format = tuple_format_by_id(stmt->format_id);
+	if (src_type == IPROTO_SELECT || src_type == IPROTO_DELETE) {
+		/*
+		 * The statement already is a key, so simply copy
+		 * it in new struct vy_stmt with the specified
+		 * type.
+		 */
+		return vy_key_from_msgpack(format, tuple_data(stmt), type);
+	}
+	assert(src_type == IPROTO_REPLACE || src_type == IPROTO_UPSERT);
 	uint32_t size;
 	size_t region_svp = region_used(region);
-	char *key = tuple_extract_key(stmt, key_def, &size);
+	const char *key = tuple_extract_key(stmt, key_def, &size);
 	if (key == NULL)
 		goto error;
 	struct tuple *ret = vy_stmt_alloc(format, size);
@@ -323,6 +379,19 @@ vy_stmt_extract_key(const struct tuple *stmt, const struct key_def *key_def,
 error:
 	region_truncate(region, region_svp);
 	return NULL;
+}
+
+struct tuple *
+vy_key_from_msgpack(struct tuple_format *format, const char *key,
+		    enum iproto_type type)
+{
+	uint32_t part_count;
+	/*
+	 * The statement already is a key, so simply copy it in
+	 * the new struct vy_stmt as SELECT.
+	 */
+	part_count = mp_decode_array(&key);
+	return vy_stmt_new_key(format, key, part_count, type);
 }
 
 int
@@ -369,14 +438,13 @@ vy_stmt_decode(struct xrow_header *xrow, struct tuple_format *format,
 			   xrow->body->iov_len) < 0)
 		return NULL;
 	struct tuple *stmt = NULL;
-	uint32_t field_count;
 	struct iovec ops;
+	const char *key = request.key;
+	(void) key;
 	switch (request.type) {
 	case IPROTO_DELETE:
-		/* extract key */
-		field_count = mp_decode_array(&request.key);
-		assert(field_count == part_count);
-		stmt = vy_stmt_new_delete(format, request.key, field_count);
+		assert(mp_decode_array(&key) == part_count);
+		stmt = vy_key_from_msgpack(format, request.key, IPROTO_DELETE);
 		break;
 	case IPROTO_REPLACE:
 		stmt = vy_stmt_new_replace(request.tuple,

@@ -1934,7 +1934,7 @@ vy_page_info_create(struct vy_page_info *page_info, uint64_t offset,
 	page_info->offset = offset;
 	page_info->unpacked_size = 0;
 	page_info->min_key = vy_stmt_extract_key(min_key, key_def,
-						 &fiber()->gc);
+						 &fiber()->gc, IPROTO_SELECT);
 	return page_info->min_key != NULL ? 0: -1;
 }
 
@@ -3050,13 +3050,15 @@ vy_index_recovery_cb(const struct vy_log_record *record, void *cb_arg)
 			return -1;
 		if (record->range_begin != NULL) {
 			range->begin = vy_key_from_msgpack(index->format,
-							   record->range_begin);
+							   record->range_begin,
+							   IPROTO_SELECT);
 			if (range->begin == NULL)
 				return -1;
 		}
 		if (record->range_end != NULL) {
 			range->end = vy_key_from_msgpack(index->format,
-							 record->range_end);
+							 record->range_end,
+							 IPROTO_SELECT);
 			if (range->end == NULL)
 				return -1;
 		}
@@ -3737,7 +3739,8 @@ vy_task_split_new(struct mempool *pool, struct vy_range *range,
 		goto err_wi;
 
 	/* Determine new ranges' boundaries. */
-	split_key = vy_key_from_msgpack(index->format, split_key_raw);
+	split_key = vy_key_from_msgpack(index->format, split_key_raw,
+					IPROTO_SELECT);
 	if (split_key == NULL)
 		goto err_split_key;
 	keys[0] = range->begin;
